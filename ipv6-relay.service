@@ -1,0 +1,36 @@
+[Unit]
+Description=IPv6 Relay Daemon
+# network.target alone only orders us after other network units start, it
+# does NOT wait for interfaces to actually be configured/up - on a fresh
+# boot this daemon was routinely starting before "wan"/"lan" had carrier,
+# which used to permanently drop those interfaces from its internal state.
+# network-online.target plus an active wait
+# service (e.g. systemd-networkd-wait-online, NetworkManager-wait-online)
+# closes most of that race; the daemon itself is now also robust to
+# interfaces still coming up late.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5
+ExecStart=/usr/sbin/ipv6-relay -c /etc/ipv6-relay/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Run unprivileged: raw sockets, netlink route access and binding to the
+# privileged DHCPv6 port (547) are granted via ambient capabilities instead
+# of root. /etc/ipv6-relay/config.json must remain world-readable (or
+# readable by this user/group) for this to work - see README.
+#
+# DynamicUser allocates a fresh, exclusive system UID/GID for this unit at
+# startup (and reclaims it on stop) instead of running as the shared
+# "nobody" account, avoiding the cross-service UID collision risk systemd
+# warns about for "nobody".
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

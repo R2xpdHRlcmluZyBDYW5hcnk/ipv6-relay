@@ -1,0 +1,23 @@
+{
+  "global": {
+    "log_level": 5,
+    "send_prefix_deprecation": true,
+    "prefix_mismatch_packet_threshold": 3,
+    "send_prefix_deprecation_interval_seconds": 300,
+    "stale_client_sweep_interval_seconds": 300
+  },
+  "interfaces": {
+    "lan": {
+      "ifname": "eth1",
+      "master": false,
+      "ndproxy_routing": true,
+      "ndp_from_link_local": true
+    },
+    "wan": {
+      "ifname": "eth0",
+      "master": true,
+      "ndproxy_routing": true,
+      "ndp_from_link_local": true
+    }
+  }
+}
