@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goarch: amd64
+            deb_arch: amd64
+          - goarch: arm64
+            deb_arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Get version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build binary
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -trimpath -ldflags="-s -w" -o ipv6-relay ./cmd/ipv6-relay
+
+      - name: Build .deb package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ARCH="${{ matrix.deb_arch }}"
+          PKG="ipv6-relay_${VERSION}_${ARCH}"
+          mkdir -p "$PKG/DEBIAN" \
+                   "$PKG/usr/sbin" \
+                   "$PKG/usr/lib/systemd/system" \
+                   "$PKG/etc/ipv6-relay"
+          install -m 755 ipv6-relay "$PKG/usr/sbin/ipv6-relay"
+          install -m 644 ipv6-relay.service "$PKG/usr/lib/systemd/system/ipv6-relay.service"
+          install -m 644 config.json.example "$PKG/etc/ipv6-relay/config.json"
+          {
+          printf 'Package: ipv6-relay\n'
+          printf 'Version: %s\n' "$VERSION"
+          printf 'Architecture: %s\n' "$ARCH"
+          printf 'Maintainer: ipv6-relay developers\n'
+          printf 'Section: net\n'
+          printf 'Priority: optional\n'
+          printf 'Description: Lightweight IPv6 relay daemon (DHCPv6 / RA / NDP relay)\n'
+          } > "$PKG/DEBIAN/control"
+          printf '/etc/ipv6-relay/config.json\n' > "$PKG/DEBIAN/conffiles"
+          {
+          printf '#!/bin/sh\n'
+          printf 'set -e\n'
+          printf 'if command -v systemctl >/dev/null 2>&1; then\n'
+          printf '    systemctl daemon-reload >/dev/null 2>&1 || true\n'
+          printf 'fi\n'
+          printf 'echo "Edit /etc/ipv6-relay/config.json, then run: systemctl enable --now ipv6-relay"\n'
+          } > "$PKG/DEBIAN/postinst"
+          chmod 755 "$PKG/DEBIAN/postinst"
+          dpkg-deb --build "$PKG"
+          mv "${PKG}.deb" "ipv6-relay_${VERSION}_linux_${ARCH}.deb"
+
+      - name: Build generic tarball
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ARCH="${{ matrix.deb_arch }}"
+          STAGE="ipv6-relay_${VERSION}_linux_${ARCH}"
+          mkdir -p "$STAGE"
+          install -m 755 ipv6-relay "$STAGE/ipv6-relay"
+          install -m 644 ipv6-relay.service "$STAGE/ipv6-relay.service"
+          install -m 644 config.json.example "$STAGE/config.json.example"
+          install -m 644 README.md LICENSE "$STAGE/"
+          tar -czf "${STAGE}.tar.gz" "$STAGE"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goarch }}
+          path: |
+            ipv6-relay_*.deb
+            ipv6-relay_*.tar.gz
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.deb *.tar.gz > SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
