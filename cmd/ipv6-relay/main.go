@@ -23,13 +23,16 @@ func ipv6Enabled() bool {
 	return true
 }
 
+const version = "v0.1"
+
 func printUsage(app string, exitCode int) {
 	fmt.Fprintf(os.Stderr, "== %s Usage ==\n"+
 		"Lightweight IPv6 Relay Daemon (DHCPv6/RA/ND relay)\n\n"+
-		"	-c <file>	Read JSON configuration from <file>\n"+
-		"	-l <int>	Specify log level 0..7 (default %d)\n"+
-		"	-f		Log to stderr instead of syslog\n"+
-		"	-h		Print this help text and exit\n",
+		"\t-c <file>\tRead JSON configuration from <file>\n"+
+		"\t-l <int>\tSpecify log level 0..7 (default %d)\n"+
+		"\t-f\t\tLog to stderr instead of syslog\n"+
+		"\t-v\t\tPrint version and exit\n"+
+		"\t-h\t\tPrint this help text and exit\n",
 		app, relay.LogWarning)
 	os.Exit(exitCode)
 }
@@ -46,10 +49,16 @@ func main() {
 	configFile := flag.String("c", "", "JSON configuration file")
 	logLevel := flag.Int("l", relay.LogWarning, "log level 0..7")
 	foreground := flag.Bool("f", false, "log to stderr instead of syslog")
+	showVersion := flag.Bool("v", false, "print version")
 	help := flag.Bool("h", false, "print usage")
 
 	flag.Usage = func() { printUsage(os.Args[0], 0) }
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("%s %s\n", os.Args[0], version)
+		os.Exit(0)
+	}
 
 	if *help {
 		printUsage(os.Args[0], 0)
