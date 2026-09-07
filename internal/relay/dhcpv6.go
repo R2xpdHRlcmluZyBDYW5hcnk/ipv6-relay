@@ -224,7 +224,7 @@ func relayServerResponse(data []byte) {
 		targetPort = dhcpv6ServerPort
 	}
 
-	peer := netip.AddrFrom16([16]byte(data[2:18]))
+	peer := netip.AddrFrom16([16]byte(data[18:34]))
 
 	Debugf("Sending a DHCPv6-reply on %s", iface.Name)
 	sendDHCPv6(iface, peer, targetPort, payload)
