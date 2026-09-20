@@ -77,7 +77,7 @@ sudo chmod 644 /etc/ipv6-relay/config.json
 | `stale_client_sweep_interval_seconds` | 可选，默认 300 | 周期性兜底扫描的间隔（秒）：清理已经 `NUD_FAILED` 或邻居表项已消失的镜像（proxy-NDP + `/128` 主机路由），并主动探测处于 `NUD_STALE` 的邻居 |
 
 本项目会对每个 `master` 接口实时 snoop 收到的真实 RA 报文，解析其中的 PIO（Prefix Information
-Option），只关心 ULA（`fc00::/7`）或公网可路由的前缀（不含 link-local、组播），并且是**一个集合**
+Option），只关心公网可路由（GUA）的前缀（不含 link-local、组播、ULA），并且是**一个集合**
 而不是单一前缀——RA 本来就可以同时携带多个前缀，只要某个前缀出现在这次收到的 RA 里，就算它仍然
 有效，不会当成过时。判断前缀是否消失**只看实时收到的 RA 报文本身**，故意不去看 WAN 口内核当前的
 地址列表——这个功能本来就是为了应对上游路由器前缀过期后不发送正确的 `valid_lft=0`/
@@ -134,6 +134,9 @@ sudo journalctl -u ipv6-relay -f
 
 ### 注意事项
 
+- **必须启用内核 IPv6 转发**（`net.ipv6.ip_forward=1` / `net.ipv6.conf.all.forwarding=1`）。中继的数据面就是内核自己的转发：NDP/RA/DHCPv6 中继在没有 forwarding 时看起来一切正常，但实际流量会被丢弃，看起来像中继的 bug。程序启动时会检测该开关并告警。
+- 转发的 RA 原样保留上游的 on-link（L）标志，下游主机会认为整个前缀在链路上、直接对 WAN 侧目标发 Neighbor Solicitation。本程序会在下游接口上为已知位于其他中继接口背后的目标安装 proxy-NDP 表项，让内核代答这些 NS（DAD 探测除外，避免干扰地址配置）；目标首次被解析期间的重传可能需要 1–2 秒才得到应答。
+- 进程退出（SIGTERM/SIGINT）时**有意不清除**已安装的 proxy-NDP 表项、/128 主机路由和 `proxy_ndp` sysctl：这样 daemon 重启/升级的窗口期内下游连通性不受影响，再次启动时会自动重建并回收这些状态。如需彻底清理，重新开关接口或重启网络即可。
 - 进程本身不再强制要求以 UID 0 运行；`systemd` 单元通过 `DynamicUser=yes` 在启动时为它分配一个专属的临时系统 UID/GID（服务停止后回收），再通过 `AmbientCapabilities`（`CAP_NET_RAW` + `CAP_NET_ADMIN` + `CAP_NET_BIND_SERVICE`）获得操作原始套接字、netlink 路由表和绑定 DHCPv6 547 端口所需的权限，不需要完整 root。
 - 如果不通过 systemd、而是手动在命令行执行 `ipv6-relay`，仍然需要 root（或者自行用 `setcap` 给二进制加上同样三个 capability 后再以非 root 用户运行）。
 - 已在测试路由器上验证：`DynamicUser` 分配的临时用户 + 上述三个 capability 可以正常完成 DHCPv6 中继（绑定 547 端口）、RA 中继（原始套接字）、NDP 中继（写 `/proc/sys/net/ipv6/conf/<if>/proxy_ndp` 需要 `CAP_NET_ADMIN`）。

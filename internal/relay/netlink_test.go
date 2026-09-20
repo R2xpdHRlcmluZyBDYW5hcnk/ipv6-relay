@@ -43,6 +43,44 @@ func TestRelayLinkAddressSkipsTentativeAddress(t *testing.T) {
 	}
 }
 
+// RFC 8415 expects a global/site address in the Relay-Forw link-address
+// field; a link-local address is never usable there, and with nothing else
+// available the caller must fall back to ::.
+func TestRelayLinkAddressSkipsLinkLocal(t *testing.T) {
+	iface := &Interface{Addr6: []IPAddr{
+		{Addr: mustParseAddr("fe80::1")},
+		{Addr: mustParseAddr("2001:db8::2")},
+	}}
+
+	got, ok := relayLinkAddress(iface)
+	if !ok || got != mustParseAddr("2001:db8::2") {
+		t.Fatalf("relayLinkAddress() = %v, %v; want 2001:db8::2, true", got, ok)
+	}
+
+	iface = &Interface{Addr6: []IPAddr{{Addr: mustParseAddr("fe80::1")}}}
+	if got, ok := relayLinkAddress(iface); ok {
+		t.Fatalf("relayLinkAddress() = %v, %v with only a link-local address; want false", got, ok)
+	}
+}
+
+// A config that cannot be parsed must be rejected as an error without
+// touching relay state - Reload relies on that to keep the running relay
+// alive when a SIGHUP lands on a broken/truncated config file.
+func TestApplyConfigJSONErrorKeepsState(t *testing.T) {
+	oldInterfaces := interfaces
+	t.Cleanup(func() { interfaces = oldInterfaces })
+
+	iface := &Interface{Name: "wan", Ifname: "wan0", Master: true, Inuse: true}
+	interfaces = map[string]*Interface{"wan": iface}
+
+	if err := applyConfigJSON([]byte(`{"interfaces": {`)); err == nil {
+		t.Fatal("applyConfigJSON() accepted truncated JSON")
+	}
+	if !iface.Inuse || len(interfaces) != 1 {
+		t.Fatalf("failed parse mutated relay state: inuse=%v ifaces=%d", iface.Inuse, len(interfaces))
+	}
+}
+
 func TestDeletedLinkClearsInterfaceState(t *testing.T) {
 	oldInterfaces := interfaces
 	oldMirrored := mirroredNeighs

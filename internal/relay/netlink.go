@@ -100,9 +100,12 @@ var mirrorSweepDone <-chan struct{}
 var mirrorSweepOnce sync.Once
 
 // scheduleMirrorSweep starts the periodic mirror sweep on its first call
-// (a no-op on subsequent calls), using whatever staleClientSweepInterval is
-// in effect at that point. Must be called after loadConfigJSON so a
-// configured global.stale_client_sweep_interval_seconds is already applied.
+// (a no-op on subsequent calls). The first delay uses the interval in effect
+// at start (i.e. after the first Reload has loaded config.json); each later
+// cycle re-reads staleClientSweepInterval, so a changed configuration takes
+// effect from the following cycle on. Must be called after loadConfigJSON so
+// a configured global.stale_client_sweep_interval_seconds is applied from
+// the start.
 func scheduleMirrorSweep() {
 	mirrorSweepOnce.Do(func() {
 		if mirrorSweepDone != nil {
@@ -249,6 +252,11 @@ func sweepIfaceFailedAndOrphans(iface *Interface) {
 		return
 	}
 
+	own := map[netip.Addr]bool{}
+	for _, a := range iface.Addr6 {
+		own[a.Addr] = true
+	}
+
 	for _, r := range routes {
 		if r.LinkIndex != iface.Ifindex || r.Priority != ourRouteMetric || r.Dst == nil {
 			continue
@@ -263,6 +271,16 @@ func sweepIfaceFailedAndOrphans(iface *Interface) {
 		}
 		addr = addr.Unmap()
 
+		// This interface's own mirrored addresses have no neighbor entry
+		// (an assigned address is not a neighbor), so the live-set check
+		// below always misses them; deleting just hands the route to
+		// reconcileKernelState to re-add a moment later - a permanent
+		// add/delete cycle. They are only ever removed via handleAddrEvent
+		// when the address itself goes away.
+		if own[addr] {
+			continue
+		}
+
 		if live[addr] {
 			continue
 		}
@@ -271,6 +289,98 @@ func sweepIfaceFailedAndOrphans(iface *Interface) {
 		Noticef("Removing orphaned host route/proxy-NDP entry %s on %s (no matching neighbor left)", addr, iface.Ifname)
 		ndpMirrorAddr(addr, iface, false)
 	}
+
+	// Downstream interfaces also accumulate proxy entries installed by
+	// handleSolicit so this link's NS for known-remote targets gets
+	// answered. Drop the ones whose target is no longer mirrored behind any
+	// other relay interface - the host they pointed at is gone, and a stale
+	// proxy entry would keep answering NS for a dead address. (Proxy
+	// entries on master interfaces are lifecycle-managed via mirroredNeighs
+	// and the own-address mirrors instead.)
+	if !iface.Master {
+		proxies, err := netlink.NeighList(link.Attrs().Index, unix.AF_INET6)
+		if err != nil {
+			Debugf("sweep: list neighbors on %s: %v", iface.Ifname, err)
+			return
+		}
+		for _, n := range proxies {
+			if n.Flags&unix.NTF_PROXY == 0 {
+				continue
+			}
+			addr, ok := netip.AddrFromSlice(n.IP.To16())
+			if !ok {
+				continue
+			}
+			addr = addr.Unmap()
+			if own[addr] || mirroredOnOtherIface(addr, iface.Ifindex) ||
+				localOnOtherIface(addr, iface.Ifindex) {
+				continue
+			}
+			if err := setupProxyNeigh(addr, iface.Ifindex, false); err != nil {
+				Debugf("sweep: stale proxy neigh %s on %s: %v", addr, iface.Ifname, err)
+			}
+		}
+	}
+}
+
+// resolvedNeighMask is the set of NUD states meaning "the kernel knows where
+// this neighbor is"; NUD_INCOMPLETE and NUD_FAILED are the complement.
+const resolvedNeighMask = unix.NUD_REACHABLE | unix.NUD_STALE | unix.NUD_DELAY |
+	unix.NUD_PROBE | unix.NUD_PERMANENT | unix.NUD_NOARP
+
+// neighResolvedOn reports whether addr has a live (not failed, not a proxy
+// entry) neighbor-cache entry on the given interface.
+func neighResolvedOn(ifindex int, addr netip.Addr) bool {
+	link, err := netlink.LinkByIndex(ifindex)
+	if err != nil {
+		return false
+	}
+	neighs, err := netlink.NeighList(link.Attrs().Index, unix.AF_INET6)
+	if err != nil {
+		return false
+	}
+	for _, n := range neighs {
+		if n.Flags&unix.NTF_PROXY != 0 {
+			continue
+		}
+		a, ok := netip.AddrFromSlice(n.IP.To16())
+		if !ok || a.Unmap() != addr {
+			continue
+		}
+		if n.State&resolvedNeighMask != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// mirroredOnOtherIface reports whether addr is a mirrored neighbor that
+// lives behind a relay interface other than excludeIfindex.
+func mirroredOnOtherIface(addr netip.Addr, excludeIfindex int) bool {
+	for k := range mirroredNeighs {
+		if k.addr == addr && k.ifindex != excludeIfindex {
+			return true
+		}
+	}
+	return false
+}
+
+// localOnOtherIface reports whether addr is one of the daemon's own
+// addresses on a relay interface other than excludeIface - i.e. an address
+// the kernel owns but, neighbor discovery being interface-scoped, will not
+// answer a solicitation for when it arrives on some other interface.
+func localOnOtherIface(addr netip.Addr, excludeIface int) bool {
+	for _, c := range interfaces {
+		if c.Ifindex == excludeIface || c.Ifindex == 0 {
+			continue
+		}
+		for _, a := range c.Addr6 {
+			if a.Addr == addr {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // reconcileDebounce coalesces the burst of RTM_DELROUTE events an external
@@ -511,10 +621,7 @@ func handleNeighEvent(u netlink.NeighUpdate) {
 	key := mirroredNeighKey{addr: addr, ifindex: iface.Ifindex}
 	mirrored := mirroredNeighs[key]
 
-	const resolvedMask = unix.NUD_REACHABLE | unix.NUD_STALE | unix.NUD_DELAY |
-		unix.NUD_PROBE | unix.NUD_PERMANENT | unix.NUD_NOARP
-
-	resolved := u.State&resolvedMask != 0
+	resolved := u.State&resolvedNeighMask != 0
 	failed := u.State&unix.NUD_FAILED != 0
 
 	if resolved && !mirrored && !addr.IsLinkLocalUnicast() {
@@ -662,11 +769,8 @@ func seedMirroredNeighbors(iface *Interface) {
 		return
 	}
 
-	const resolvedMask = unix.NUD_REACHABLE | unix.NUD_STALE | unix.NUD_DELAY |
-		unix.NUD_PROBE | unix.NUD_PERMANENT | unix.NUD_NOARP
-
 	for _, n := range neighs {
-		if n.State&resolvedMask == 0 {
+		if n.State&resolvedNeighMask == 0 {
 			continue
 		}
 

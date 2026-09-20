@@ -88,6 +88,16 @@ func bindToDevice(fd int, ifname string) error {
 	return unix.BindToDevice(fd, ifname)
 }
 
+// setRecvTimeout caps how long a blocking read waits before returning
+// EAGAIN, so a reader goroutine always wakes up, re-checks its done channel
+// and exits promptly on teardown: close(2) does not interrupt a recv blocked
+// on a socket, which would strand the goroutine forever - and after a reload
+// hands the fd number to a replacement socket, leave a stale reader around it.
+func setRecvTimeout(fd int) error {
+	tv := unix.Timeval{Sec: 1}
+	return unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv)
+}
+
 // setsockoptInt is a small readability wrapper.
 func setsockoptInt(fd, level, opt, val int) error {
 	return unix.SetsockoptInt(fd, level, opt, val)

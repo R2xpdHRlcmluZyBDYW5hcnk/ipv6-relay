@@ -107,6 +107,16 @@ func main() {
 		os.Exit(4)
 	}
 
+	// The relay's data plane is the kernel's: packets for mirrored
+	// neighbors only actually move if IPv6 forwarding is on. NDP/RA/DHCPv6
+	// relaying all "work" without it, which makes a missing forwarding
+	// setting look like a relay bug - warn loudly instead.
+	if b, err := os.ReadFile("/proc/sys/net/ipv6/conf/all/forwarding"); err != nil {
+		relay.Warnf("Cannot read net.ipv6.conf.all.forwarding: %v", err)
+	} else if len(b) == 0 || b[0] != '1' {
+		relay.Warnf("net.ipv6.conf.all.forwarding is not 1 - relayed NDP/RA/DHCPv6 works, but forwarded traffic will be dropped. Enable IPv6 forwarding (e.g. net.ipv6.ip_forward=1)")
+	}
+
 	done := make(chan struct{})
 	if err := relay.StartNetlinkMonitor(done); err != nil {
 		relay.Errorf("Unable to start netlink monitor: %v", err)

@@ -129,6 +129,7 @@ func ndpSetup(iface *Interface, enable bool) error {
 	}()
 
 	if err := setProxyNDP(iface.Ifname, true); err != nil {
+		Errorf("proxy_ndp(%s): %v", iface.Ifname, err)
 		return err
 	}
 
@@ -148,6 +149,10 @@ func ndpSetup(iface *Interface, enable bool) error {
 	sll := &unix.SockaddrLinklayer{Protocol: swap16(uint16(unix.ETH_P_ALL)), Ifindex: iface.Ifindex}
 	if err := unix.Bind(captureFd, sll); err != nil {
 		Errorf("bind(AF_PACKET): %v", err)
+		return err
+	}
+	if err := setRecvTimeout(captureFd); err != nil {
+		Errorf("SO_RCVTIMEO: %v", err)
 		return err
 	}
 
@@ -199,6 +204,9 @@ func ndpReadLoop(ns *ndpSock) {
 		n, from, err := unix.Recvfrom(ns.fd, buf, 0)
 		if err != nil {
 			if err == unix.EINTR {
+				continue
+			}
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				continue
 			}
 			select {
@@ -270,13 +278,71 @@ func handleSolicit(ns *ndpSock, srcMAC [6]byte, data []byte) {
 		return // our own probe looping back on a non-master interface
 	}
 
-	_ = nsIsDAD
+	// The kernel answers Neighbor Solicitations for this interface's own
+	// addresses natively; probing them on other interfaces is pure noise.
+	for _, a := range iface.Addr6 {
+		if a.Addr == target {
+			return
+		}
+	}
+
+	// A host already resolved on this very link answers for itself -
+	// proxy-answering or probing here would only hijack its traffic through
+	// us, and for two hosts on the same downstream segment the hairpinned
+	// packet would blackhole (no route to hand it back out with).
+	if neighResolvedOn(iface.Ifindex, target) {
+		return
+	}
+
+	// This is the LAN→WAN half of the relay. The relayed RA carries the
+	// upstream's on-link (L) flag verbatim, so downstream hosts treat the
+	// whole relayed prefix as on-link and resolve WAN-side destinations
+	// with a link-local NS. ndpMirrorAddr only installs proxy entries on
+	// master interfaces, so unless the kernel also has one for the target
+	// on THIS interface, nobody ever answers and the NS times out - the
+	// direction that has no default route to fall back on is exactly the
+	// one that breaks. Once the target is known to live behind another
+	// relay interface, install the proxy entry here and let the kernel
+	// answer; the soliciting host's next retransmission gets served. DAD
+	// probes must never be answered this way, or the address being
+	// configured looks duplicated to its owner.
+	if wantProxyOnIface(iface, target, nsIsDAD) {
+		if err := setupProxyNeigh(target, iface.Ifindex, true); err != nil {
+			Debugf("proxy neigh %s on %s: %v", target, iface.Ifname, err)
+		}
+	}
 
 	for _, c := range interfaces {
 		if c != iface && c.NDP == ModeRelay {
 			relayPing(target, c)
 		}
 	}
+}
+
+// wantProxyOnIface decides whether the kernel needs a proxy entry for target
+// on the interface an NS was just heard on: never for DAD (that would make
+// the probed address look in-use to its owner), never for the interface's
+// own addresses (the kernel answers those itself), but yes once the target
+// is known to live elsewhere - either behind a different relay interface
+// (mirrored remote host) or as another interface's own address (neighbor
+// discovery is interface-scoped: the kernel does not answer on lan1 for an
+// address assigned to wan). Without the proxy, a downstream host that
+// learned the relayed prefix as on-link resolves such targets with a
+// link-local NS that nobody answers. Answering for a same-segment host that
+// just hasn't been resolved yet is deliberately excluded: it would hijack
+// the host's traffic through the relay instead of letting it answer
+// directly.
+func wantProxyOnIface(iface *Interface, target netip.Addr, nsIsDAD bool) bool {
+	if nsIsDAD {
+		return false
+	}
+	for _, a := range iface.Addr6 {
+		if a.Addr == target {
+			return false
+		}
+	}
+	return mirroredOnOtherIface(target, iface.Ifindex) ||
+		localOnOtherIface(target, iface.Ifindex)
 }
 
 // relayPing sends an ICMPv6 echo request to target out iface, pinned there

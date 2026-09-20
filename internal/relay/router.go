@@ -97,6 +97,10 @@ func routerSetup(iface *Interface, enable bool) error {
 		Errorf("ICMP6_FILTER: %v", err)
 		return err
 	}
+	if err := setRecvTimeout(fd); err != nil {
+		Errorf("SO_RCVTIMEO: %v", err)
+		return err
+	}
 
 	group := allIPv6Routers
 	if iface.Master {
@@ -269,6 +273,9 @@ func routerReadLoop(rs *routerSock) {
 			if err == unix.EINTR {
 				continue
 			}
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				continue
+			}
 			select {
 			case <-rs.done:
 				return
@@ -311,12 +318,22 @@ func handleICMPv6(rs *routerSock, data []byte) {
 
 	switch icmpType {
 	case ndRouterSolicit:
-		forwardRouterSolicitation(iface)
-	case ndRouterAdvert:
-		if iface.Master {
-			captureLastRAHeader(iface, data)
-			trackWANPrefixSnooping(iface, data)
+		// RS flow downstream→upstream only: one heard on a master belongs
+		// to the upstream link itself and must not be re-propagated.
+		if !iface.Master {
+			forwardRouterSolicitation(iface)
 		}
+	case ndRouterAdvert:
+		// RA flow upstream→downstream only. Ignoring RAs heard on slaves
+		// also closes the loop where two downstream interfaces sharing one
+		// L2 segment would relay each other's (already relayed) RAs back
+		// and forth forever - our own sends are loop-free on the sending
+		// interface (IPV6_MULTICAST_LOOP=0) but not on the peer's.
+		if !iface.Master {
+			return
+		}
+		captureLastRAHeader(iface, data)
+		trackWANPrefixSnooping(iface, data)
 		forwardRouterAdvertisement(iface, data)
 	}
 }

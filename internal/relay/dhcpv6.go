@@ -94,6 +94,10 @@ func dhcpv6Setup(iface *Interface, enable bool) error {
 		Errorf("bind(:%d): %v", dhcpv6ServerPort, err)
 		return err
 	}
+	if err := setRecvTimeout(fd); err != nil {
+		Errorf("SO_RCVTIMEO: %v", err)
+		return err
+	}
 
 	if err := joinMulticast6(fd, allDHCPv6Relays, iface.Ifindex, true); err != nil {
 		Errorf("IPV6_ADD_MEMBERSHIP: %v", err)
@@ -120,9 +124,12 @@ func dhcpReadLoop(ds *dhcpSock) {
 		default:
 		}
 
-		n, oobn, _, from, err := unix.Recvmsg(ds.fd, buf, oob, 0)
+		n, _, _, from, err := unix.Recvmsg(ds.fd, buf, oob, 0)
 		if err != nil {
 			if err == unix.EINTR {
+				continue
+			}
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				continue
 			}
 			select {
@@ -137,10 +144,12 @@ func dhcpReadLoop(ds *dhcpSock) {
 			continue
 		}
 
-		_, hoplimit, hasHL := parseCmsgs(oob[:oobn])
-		if hasHL && hoplimit != 255 {
-			continue
-		}
+		// Note: unlike the RA/NS sockets, the DHCPv6 socket deliberately
+		// does not validate the hop limit (and does not even request
+		// IPV6_RECVHOPLIMIT): a server's Relay-Reply arrives via ordinary
+		// unicast routing with a normal, kernel-decremented hop limit, so
+		// the RFC 4861-style 255 check used on the RA/NS sockets would
+		// silently drop every reply from a server more than one hop away.
 
 		var src netip.Addr
 		if sa6, ok := from.(*unix.SockaddrInet6); ok {

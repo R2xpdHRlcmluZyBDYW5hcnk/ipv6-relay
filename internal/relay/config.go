@@ -159,18 +159,32 @@ func parseInterfaceJSON(name string, obj jsonIface) error {
 	return nil
 }
 
-// loadConfigJSON reads and parses the JSON configuration file.
-func loadConfigJSON(path string) {
+// loadConfigJSON reads and applies the JSON configuration file. It either
+// applies the file completely or leaves all relay state untouched: a config
+// that cannot be read or parsed (a truncated file mid-edit, hit by a
+// SIGHUP) must never tear the running relay down.
+func loadConfigJSON(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		Errorf("Failed to read JSON config from %s: %v", path, err)
-		return
+		return fmt.Errorf("read %s: %w", path, err)
 	}
+	return applyConfigJSON(data)
+}
 
+// applyConfigJSON parses and applies configuration content. State is only
+// mutated once the JSON has parsed successfully.
+func applyConfigJSON(data []byte) error {
 	var root jsonRoot
 	if err := json.Unmarshal(data, &root); err != nil {
-		Errorf("Failed to parse JSON config from %s: %v", path, err)
-		return
+		return fmt.Errorf("parse: %w", err)
+	}
+
+	// The file is good - reset every interface to its defaults and mark it
+	// not-in-use; parseInterfaceJSON below re-marks the ones present in the
+	// file and Reload closes the rest.
+	for _, i := range interfaces {
+		setInterfaceDefaults(i)
+		i.Inuse = false
 	}
 
 	if root.Global != nil && root.Global.LogLevel != nil && !Cfg.LogLevelCmdline {
@@ -199,11 +213,20 @@ func loadConfigJSON(path string) {
 			Warnf("%v", err)
 		}
 	}
+
+	return nil
 }
 
 // closeInterface tears down and forgets an interface that is no longer
 // present in the config.
 func closeInterface(i *Interface) {
+	// Kernel state installed for this interface (its /128 host routes and
+	// the proxy-NDP entries mirrored onto the masters) must go with it:
+	// the periodic sweep only inspects interfaces still in the map, so
+	// anything left behind here would leak until the next restart. Must
+	// run while i is still registered, since ndpMirrorAddr iterates the
+	// map to find the masters.
+	clearMirroredState(i)
 	delete(interfaces, i.Name)
 
 	routerSetup(i, false)
@@ -241,12 +264,11 @@ func disableServices(i *Interface) {
 // Reload re-reads the config file from scratch and applies it, including the
 // "disable master relay if there is no slave" logic. Must run on the Engine goroutine.
 func Reload() {
-	for _, i := range interfaces {
-		setInterfaceDefaults(i)
-		i.Inuse = false
+	if err := loadConfigJSON(Cfg.ConfigFile); err != nil {
+		Errorf("Keeping previous configuration: %v", err)
+		scheduleMirrorSweep()
+		return
 	}
-
-	loadConfigJSON(Cfg.ConfigFile)
 
 	// Only after config.json has been loaded (so a configured
 	// global.stale_client_sweep_interval_seconds already took effect) - see

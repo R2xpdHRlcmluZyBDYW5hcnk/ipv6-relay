@@ -153,15 +153,22 @@ func getLinkLocalAddr(iface *Interface) (netip.Addr, bool) {
 	return netip.Addr{}, false
 }
 
-// relayLinkAddress picks an appropriate address for relaying:
-// prefer an address that is both valid and preferred; fall back to
-// whichever valid address has the longest remaining valid lifetime.
+// relayLinkAddress picks an appropriate address for the DHCPv6 Relay-Forw
+// link-address field: prefer an address that is both valid and preferred;
+// fall back to whichever valid address has the longest remaining valid
+// lifetime. Link-local addresses are never returned - RFC 8415 expects a
+// global/site address identifying the link, and with none available the
+// caller falls back to ::.
 func relayLinkAddress(iface *Interface) (netip.Addr, bool) {
 	now := uint32(nowMono())
 	var best *IPAddr
 
 	for idx := range iface.Addr6 {
 		a := &iface.Addr6[idx]
+
+		if a.Addr.IsLinkLocalUnicast() {
+			continue
+		}
 
 		if a.Tentative || (a.ValidLT != 0 && a.ValidLT <= now) {
 			continue // expired
