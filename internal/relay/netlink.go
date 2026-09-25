@@ -286,7 +286,7 @@ func sweepIfaceFailedAndOrphans(iface *Interface) {
 		}
 
 		delete(mirroredNeighs, mirroredNeighKey{addr: addr, ifindex: iface.Ifindex})
-		Noticef("Removing orphaned host route/proxy-NDP entry %s on %s (no matching neighbor left)", addr, iface.Ifname)
+		Infof("Removing orphaned host route/proxy-NDP entry %s on %s (no matching neighbor left)", addr, iface.Ifname)
 		ndpMirrorAddr(addr, iface, false)
 	}
 
