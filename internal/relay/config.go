@@ -189,7 +189,11 @@ func applyConfigJSON(data []byte) error {
 
 	if root.Global != nil && root.Global.LogLevel != nil && !Cfg.LogLevelCmdline {
 		SetLogLevel(*root.Global.LogLevel)
-		Noticef("Log level set to %d", LogLevel())
+		// Write straight to stderr (like the other startup notes) instead
+		// of Noticef: journald records stderr as info, so this note is
+		// shown regardless of the configured log level and journalctl
+		// never renders it bold (it bolds NOTICE-priority messages).
+		fmt.Fprintf(os.Stderr, "Log level set to %d\n", LogLevel())
 	}
 
 	if root.Global != nil && root.Global.NotifyPrefixDeprecation != nil {

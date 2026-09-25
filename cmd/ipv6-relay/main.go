@@ -90,10 +90,13 @@ func main() {
 	// get them, but an unprivileged user also works as long as it has
 	// been granted CAP_NET_RAW, CAP_NET_ADMIN and CAP_NET_BIND_SERVICE
 	// (e.g. via systemd AmbientCapabilities=). Individual socket/bind/
-	// setsockopt failures are already reported by their call sites, so we
-	// only warn here instead of hard-failing on non-root uid.
+	// setsockopt failures are already reported by their call sites, so
+	// this note is purely informational: write it straight to stderr
+	// (like the other startup notes) instead of the level-filtered
+	// syslog helpers - journald records stderr as info, so it always
+	// shows up and stays neutral-colored rather than warning/error.
 	if u, err := user.Current(); err != nil || u.Uid != "0" {
-		relay.Errorf("Not running as root - relying on CAP_NET_RAW/CAP_NET_ADMIN/CAP_NET_BIND_SERVICE")
+		fmt.Fprintln(os.Stderr, "Not running as root - relying on CAP_NET_RAW/CAP_NET_ADMIN/CAP_NET_BIND_SERVICE")
 	}
 
 	if *configFile == "" {
