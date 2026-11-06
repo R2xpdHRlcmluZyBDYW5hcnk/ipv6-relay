@@ -70,7 +70,7 @@ jobs:
           printf 'echo "Edit /etc/ipv6-relay/config.json, then run: systemctl enable --now ipv6-relay"\n'
           } > "$PKG/DEBIAN/postinst"
           chmod 755 "$PKG/DEBIAN/postinst"
-          dpkg-deb --build "$PKG"
+          dpkg-deb --root-owner-group --build "$PKG"
           mv "${PKG}.deb" "ipv6-relay_${VERSION}_linux_${ARCH}.deb"
 
       - name: Build generic tarball
@@ -83,7 +83,7 @@ jobs:
           install -m 644 ipv6-relay.service "$STAGE/ipv6-relay.service"
           install -m 644 config.json.example "$STAGE/config.json.example"
           install -m 644 README.md LICENSE "$STAGE/"
-          tar -czf "${STAGE}.tar.gz" "$STAGE"
+          tar --owner=0 --group=0 --numeric-owner -czf "${STAGE}.tar.gz" "$STAGE"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
