@@ -333,7 +333,7 @@ func handleICMPv6(rs *routerSock, data []byte) {
 			return
 		}
 		captureLastRAHeader(iface, data)
-		trackWANPrefixSnooping(iface, data)
+		trackWANPrefixSnooping(iface, data, time.Now())
 		forwardRouterAdvertisement(iface, data)
 	}
 }

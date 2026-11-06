@@ -9,46 +9,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// sendPrefixDeprecation/prefixMismatchThreshold/sendPrefixDeprecationInterval
-// are the global tunables the user gets for this feature (config.json's
-// global.send_prefix_deprecation / global.prefix_mismatch_packet_threshold
-// / global.send_prefix_deprecation_interval_seconds - see config.go's
-// loadConfigJSON). Deliberately package vars with sane defaults rather than
-// requiring config: this is a mitigation for upstream routers that
-// renumber a delegated prefix without ever sending a proper RFC 4861
-// zero-lifetime withdrawal for the old one, left on by default.
-//
-// *Detection* is driven entirely by real-time snooping of the actual
-// Router Advertisements received on each master (WAN) interface - not by a
-// timer, and deliberately NOT cross-checked against the interface's own
-// kernel address list: this feature exists specifically to cover upstream
-// routers that never send a proper RFC 4861 zero-lifetime withdrawal for a
-// dead prefix, in which case the kernel's own SLAAC address for it also
-// just lingers (counting down whatever valid_lft the last real RA gave it)
-// instead of disappearing promptly - falling back to "does the interface
-// still have an address under it" would defeat the whole point and mask
-// real detections. An RA can legitimately carry several prefixes at once,
-// so any prefix present in the just-received RA is never a mismatch. A
-// previously-known prefix is only declared dead once it is absent from
-// prefixMismatchThreshold consecutive real RAs. Once dead, *notifying* LAN
-// neighbors still using it IS periodic/timer-based (see
-// startPrefixDeprecationWatch), repeating every sendPrefixDeprecationInterval
-// until none remain. If the user doesn't want this automatic notification
-// at all, they can turn it off entirely via global.send_prefix_deprecation
-// - that is the intended off switch, not silently disabling detection via
-// an address-list fallback.
-//
-// Detection alone would still miss one case: knownWANPrefixes is purely
-// in-memory, so a (re)start silently reseeds it from scratch (see
-// trackWANPrefixSnooping) - if the WAN had already renumbered before the
-// restart, the daemon never personally observes the old prefix's mismatch
-// streak run out, and a LAN host that hadn't yet dropped its old address
-// would otherwise be left stranded forever. checkForOrphanedLANNeighbors
-// is the backstop for exactly that: after every real RA, it also checks
-// every LAN neighbor's address against the union of every seeded master's
-// currently-known prefixes and starts notifying any address that doesn't
-// fall under any of them, regardless of whether this process ever
-// personally watched that prefix die.
 var (
 	sendPrefixDeprecation         = true
 	prefixMismatchThreshold       = 3
@@ -81,200 +41,109 @@ func isGlobalUnicast(addr netip.Addr) bool {
 	return trackablePrefixAddr(addr)
 }
 
-// parsePIOPrefixes walks a Router Advertisement's options (data must start
-// at the ICMPv6 header, i.e. include the fixed 16-byte RA header) and
-// returns every Prefix Information Option's prefix that is globally
-// routable unicast, masked to its advertised prefix length.
-func parsePIOPrefixes(data []byte) []netip.Prefix {
+// parsePIOPrefixes returns the advertised Valid Lifetime for each usable PIO.
+// A nil map means the RA header or option framing was invalid.
+func parsePIOPrefixes(data []byte) map[netip.Prefix]uint32 {
 	const raHdrLen = 16
-	const pioOptType = 3
-	const pioOptLen = 32 // 4 * 8 bytes
+	const pioOptLen = 32
 
 	if len(data) < raHdrLen {
 		return nil
 	}
 
-	var out []netip.Prefix
-	opt := raHdrLen
-	for opt+2 <= len(data) {
-		optType := data[opt]
-		optLen := int(data[opt+1]) * 8
-		if optLen == 0 || opt+optLen > len(data) {
-			break
+	prefixes := make(map[netip.Prefix]uint32)
+	for off := raHdrLen; off < len(data); {
+		if len(data)-off < 2 {
+			return nil
 		}
-
-		if optType == pioOptType && optLen >= pioOptLen {
-			prefixLen := int(data[opt+2])
-			addr, ok := netip.AddrFromSlice(data[opt+16 : opt+32])
-			if ok && prefixLen >= 0 && prefixLen <= 128 {
-				a := addr.Unmap()
-				if isGlobalUnicast(a) {
-					if p, err := a.Prefix(prefixLen); err == nil {
-						out = append(out, p.Masked())
-					}
-				}
+		optLen := int(data[off+1]) * 8
+		if optLen == 0 || optLen > len(data)-off {
+			return nil
+		}
+		if data[off] == ndOptPrefixInfo && optLen == pioOptLen {
+			opt := data[off : off+optLen]
+			valid := binary.BigEndian.Uint32(opt[4:8])
+			preferred := binary.BigEndian.Uint32(opt[8:12])
+			addr := netip.AddrFrom16([16]byte(opt[16:32]))
+			if opt[2] <= 128 && preferred <= valid && trackablePrefixAddr(addr.Unmap()) {
+				prefixes[netip.PrefixFrom(addr, int(opt[2])).Masked()] = valid
 			}
 		}
-
-		opt += optLen
+		off += optLen
 	}
-	return out
+	return prefixes
 }
 
-// trackWANPrefixSnooping is called for every real Router Advertisement
-// received on a master interface (see handleICMPv6/captureLastRAHeader in
-// router.go). It maintains iface.knownWANPrefixes, the set of GUA
-// prefixes currently considered "live" on this interface, purely from
-// real-time packet snooping (see the package doc comment above for why
-// this deliberately does NOT fall back to the kernel's own address list):
-// every prefix carried by this RA is (re)confirmed known immediately - an
-// RA can legitimately carry several at once. A previously-known prefix
-// absent from prefixMismatchThreshold consecutive real RAs is declared
-// dead and handed off to startPrefixDeprecationWatch. The very first real
-// RA observed on an interface only silently seeds knownWANPrefixes (so a
-// fresh (re)start never misjudges an already-legitimate prefix as dead
-// just because it hasn't been observed before). Must run on the Engine
-// goroutine.
-func trackWANPrefixSnooping(iface *Interface, data []byte) {
-	raPrefixes := parsePIOPrefixes(data)
+type wanPrefixState struct {
+	validUntil time.Time // zero means infinite
+	misses     int
+}
 
-	confirmed := map[netip.Prefix]bool{}
-	for _, p := range raPrefixes {
-		confirmed[p] = true
+func (p wanPrefixState) validAt(now time.Time) bool {
+	return p.validUntil.IsZero() || now.Before(p.validUntil)
+}
+
+// trackWANPrefixSnooping uses the last advertised Valid Lifetime. An omitted
+// PIO can count toward the miss threshold, but cannot shorten that lifetime.
+func trackWANPrefixSnooping(iface *Interface, data []byte, now time.Time) {
+	advertised := parsePIOPrefixes(data)
+	if advertised == nil {
+		return
 	}
-
 	if iface.knownWANPrefixes == nil {
-		iface.knownWANPrefixes = map[netip.Prefix]bool{}
+		iface.knownWANPrefixes = make(map[netip.Prefix]wanPrefixState)
 	}
 
-	if !iface.wanPrefixSeeded {
-		iface.wanPrefixSeeded = true
-		for p := range confirmed {
-			iface.knownWANPrefixes[p] = true
-		}
-		checkForOrphanedLANNeighbors(iface)
-		return
-	}
-
-	// Anything carried by this RA is confirmed live: add it (if new) and
-	// clear any accumulated miss count.
-	for p := range confirmed {
-		iface.knownWANPrefixes[p] = true
-		delete(iface.missCounts, p)
-	}
-
-	// Anything previously known but absent from this RA accumulates a
-	// miss; only declared dead after prefixMismatchThreshold consecutive
-	// misses.
-	for p := range iface.knownWANPrefixes {
-		if confirmed[p] {
+	for prefix, lifetime := range advertised {
+		if lifetime == 0 {
 			continue
 		}
-
-		if iface.missCounts == nil {
-			iface.missCounts = map[netip.Prefix]int{}
+		state := wanPrefixState{}
+		if lifetime != 0xffffffff {
+			state.validUntil = now.Add(time.Duration(lifetime) * time.Second)
 		}
-		iface.missCounts[p]++
-		if iface.missCounts[p] < prefixMismatchThreshold {
-			continue
-		}
-
-		delete(iface.knownWANPrefixes, p)
-		delete(iface.missCounts, p)
-
-		Noticef("WAN prefix %s on %s missing from %d consecutive RAs, notifying LAN neighbors under it",
-			p, iface.Ifname, prefixMismatchThreshold)
-
-		startPrefixDeprecationWatch(iface, p)
+		iface.knownWANPrefixes[prefix] = state
+		cancelPrefixDeprecationWatch(prefix)
 	}
 
-	checkForOrphanedLANNeighbors(iface)
+	for prefix, state := range iface.knownWANPrefixes {
+		lifetime, present := advertised[prefix]
+		if present && lifetime != 0 {
+			continue
+		}
+		if !present {
+			if state.misses < prefixMismatchThreshold {
+				state.misses++
+			}
+			if state.misses < prefixMismatchThreshold || state.validAt(now) {
+				iface.knownWANPrefixes[prefix] = state
+				continue
+			}
+		}
+
+		delete(iface.knownWANPrefixes, prefix)
+		if !prefixIsLive(prefix, now) {
+			startPrefixDeprecationWatch(iface, prefix)
+		}
+	}
 }
 
-// checkForOrphanedLANNeighbors is the restart-safety backstop for this
-// feature: trackWANPrefixSnooping's own knownWANPrefixes is purely
-// in-memory and gets silently reseeded from scratch on every (re)start, so
-// if the WAN had already renumbered before a restart, the daemon never
-// personally observes the old prefix's mismatch streak run out - it just
-// starts fresh, already only knowing the new prefix. Without this check, a
-// LAN host that hadn't yet dropped its old-prefix address before the
-// restart (RFC 4862 5.5.3(e) alone can keep one usable for up to ~2h after
-// a real deprecation, and indefinitely if no deprecation was ever sent at
-// all) would keep trying to use it and fail, with nothing left to ever
-// tell it otherwise. So, alongside comparing this RA against the WAN
-// prefix set, also enumerate every LAN neighbor's address and check it
-// against the same set: any GUA neighbor address not covered by any
-// currently-known WAN prefix (from any seeded master) is orphaned and gets
-// a deprecation watch started for its /64 - the real neighbor cache
-// doesn't record the prefix length a host actually configured, so /64 (the
-// de-facto standard SLAAC length) is the best grouping key available.
-func checkForOrphanedLANNeighbors(masterIface *Interface) {
-	known := map[netip.Prefix]bool{}
-	anySeeded := false
+func prefixIsLive(prefix netip.Prefix, now time.Time) bool {
 	for _, iface := range interfaces {
-		if !iface.Master || !iface.wanPrefixSeeded {
-			continue
-		}
-		anySeeded = true
-		for p := range iface.knownWANPrefixes {
-			known[p] = true
+		if state, ok := iface.knownWANPrefixes[prefix]; iface.Master && ok && state.validAt(now) {
+			return true
 		}
 	}
-	if !anySeeded {
-		return
-	}
+	return false
+}
 
-	orphaned := map[netip.Prefix]bool{}
-	for _, c := range interfaces {
-		if c.Master || c.RA != ModeRelay {
-			continue
+func resetWANPrefixes(iface *Interface) {
+	iface.knownWANPrefixes = nil
+	iface.haveLastRA = false
+	for prefix, watch := range activePrefixWatches {
+		if watch.master == iface {
+			cancelPrefixDeprecationWatch(prefix)
 		}
-
-		link, err := netlink.LinkByIndex(c.Ifindex)
-		if err != nil {
-			continue
-		}
-		neighs, err := netlink.NeighList(link.Attrs().Index, unix.AF_INET6)
-		if err != nil {
-			continue
-		}
-
-		for _, n := range neighs {
-			if n.Flags&unix.NTF_PROXY != 0 {
-				continue // our own proxy-NDP entries, not real neighbors
-			}
-
-			addr, ok := netip.AddrFromSlice(n.IP.To16())
-			if !ok {
-				continue
-			}
-			addr = addr.Unmap()
-			if !trackablePrefixAddr(addr) {
-				continue
-			}
-
-			covered := false
-			for p := range known {
-				if p.Contains(addr) {
-					covered = true
-					break
-				}
-			}
-			if covered {
-				continue
-			}
-
-			orphaned[netip.PrefixFrom(addr, 64).Masked()] = true
-		}
-	}
-
-	for p := range orphaned {
-		if activePrefixWatches[p] != nil {
-			continue
-		}
-
-		Noticef("LAN neighbor address under %s doesn't fall under any currently-known WAN prefix (restart backstop), notifying it", p)
-		startPrefixDeprecationWatch(masterIface, p)
 	}
 }
 
@@ -284,7 +153,17 @@ func checkForOrphanedLANNeighbors(masterIface *Interface) {
 var activePrefixWatches = map[netip.Prefix]*prefixDeprecationWatch{}
 
 type prefixDeprecationWatch struct {
-	timer *time.Timer
+	master *Interface
+	timer  *time.Timer
+}
+
+func cancelPrefixDeprecationWatch(prefix netip.Prefix) {
+	if w := activePrefixWatches[prefix]; w != nil {
+		if w.timer != nil {
+			w.timer.Stop()
+		}
+		delete(activePrefixWatches, prefix)
+	}
 }
 
 // startPrefixDeprecationWatch begins (if not already running, and if not
@@ -300,16 +179,24 @@ func startPrefixDeprecationWatch(masterIface *Interface, prefix netip.Prefix) {
 		return
 	}
 
-	w := &prefixDeprecationWatch{}
+	w := &prefixDeprecationWatch{master: masterIface}
 	activePrefixWatches[prefix] = w
-	firePrefixDeprecationWatch(masterIface, prefix, w)
+	firePrefixDeprecationWatch(prefix, w)
 }
 
 // firePrefixDeprecationWatch sends one round of the deprecation RA and
 // either reschedules itself in sendPrefixDeprecationInterval, or - once no LAN
 // neighbor remains under prefix - stops and forgets this watch.
-func firePrefixDeprecationWatch(masterIface *Interface, prefix netip.Prefix, w *prefixDeprecationWatch) {
-	remaining := sendPrefixDeprecationRA(masterIface, prefix)
+func firePrefixDeprecationWatch(prefix netip.Prefix, w *prefixDeprecationWatch) {
+	if activePrefixWatches[prefix] != w {
+		return // the timer callback may already have been queued when canceled
+	}
+	if !sendPrefixDeprecation || prefixIsLive(prefix, time.Now()) {
+		cancelPrefixDeprecationWatch(prefix)
+		return
+	}
+
+	remaining := sendPrefixDeprecationRA(w.master, prefix)
 	if remaining == 0 {
 		delete(activePrefixWatches, prefix)
 		Noticef("No LAN neighbors remain under deprecated WAN prefix %s, stopping notifications", prefix)
@@ -317,7 +204,7 @@ func firePrefixDeprecationWatch(masterIface *Interface, prefix netip.Prefix, w *
 	}
 
 	w.timer = time.AfterFunc(sendPrefixDeprecationInterval, func() {
-		Eng.Post(func() { firePrefixDeprecationWatch(masterIface, prefix, w) })
+		Eng.Post(func() { firePrefixDeprecationWatch(prefix, w) })
 	})
 }
 

@@ -107,10 +107,11 @@ var mirrorSweepOnce sync.Once
 // a configured global.stale_client_sweep_interval_seconds is applied from
 // the start.
 func scheduleMirrorSweep() {
+	if mirrorSweepDone == nil {
+		return
+	}
 	mirrorSweepOnce.Do(func() {
-		if mirrorSweepDone != nil {
-			startMirrorSweep(mirrorSweepDone)
-		}
+		startMirrorSweep(mirrorSweepDone)
 	})
 }
 
@@ -118,7 +119,12 @@ func scheduleMirrorSweep() {
 // /128 host routes with (see ndpMirrorAddr). relay_ping's throwaway route uses
 // a different metric, so filtering on this value keeps that churn from
 // triggering reconciliation.
-const ourRouteMetric = 1024
+const (
+	ourRouteMetric = 1024
+	// The route protocol distinguishes relay routes from administrator routes
+	// with the same metric and is preserved across daemon restarts.
+	relayRouteProtocol = 196
+)
 
 // staleClientSweepInterval is how often sweepFailedAndOrphans runs as a
 // periodic backstop, in addition to the event-driven cleanup in
@@ -152,17 +158,17 @@ var staleClientSweepInterval = 300 * time.Second
 // startMirrorSweep arranges for sweepFailedAndOrphans to run every
 // staleClientSweepInterval until done is closed.
 func startMirrorSweep(done <-chan struct{}) {
-	var tick func()
-	tick = func() {
-		select {
-		case <-done:
-			return
-		default:
-		}
-		Eng.Post(sweepFailedAndOrphans)
-		time.AfterFunc(staleClientSweepInterval, tick)
-	}
-	time.AfterFunc(staleClientSweepInterval, tick)
+	time.AfterFunc(staleClientSweepInterval, func() {
+		Eng.Post(func() {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			sweepFailedAndOrphans()
+			startMirrorSweep(done)
+		})
+	})
 }
 
 // sweepFailedAndOrphans is the periodic backstop counterpart to
@@ -246,6 +252,16 @@ func sweepIfaceFailedAndOrphans(iface *Interface) {
 		}
 	}
 
+	// A neighbor may have been mirrored without a route, for example when
+	// ndproxy_routing is disabled. Drop its cached mirror independently of
+	// the route dump so it cannot keep stale downstream proxies alive.
+	for key := range mirroredNeighs {
+		if key.ifindex == iface.Ifindex && !live[key.addr] {
+			delete(mirroredNeighs, key)
+			ndpMirrorAddr(key.addr, iface, false)
+		}
+	}
+
 	routes, err := netlink.RouteList(link, unix.AF_INET6)
 	if err != nil {
 		Debugf("sweep: list routes on %s: %v", iface.Ifname, err)
@@ -258,10 +274,7 @@ func sweepIfaceFailedAndOrphans(iface *Interface) {
 	}
 
 	for _, r := range routes {
-		if r.LinkIndex != iface.Ifindex || r.Priority != ourRouteMetric || r.Dst == nil {
-			continue
-		}
-		if ones, bits := r.Dst.Mask.Size(); bits != 128 || ones != 128 {
+		if !isRelayHostRoute(r) || r.LinkIndex != iface.Ifindex {
 			continue
 		}
 
@@ -285,7 +298,6 @@ func sweepIfaceFailedAndOrphans(iface *Interface) {
 			continue
 		}
 
-		delete(mirroredNeighs, mirroredNeighKey{addr: addr, ifindex: iface.Ifindex})
 		Infof("Removing orphaned host route/proxy-NDP entry %s on %s (no matching neighbor left)", addr, iface.Ifname)
 		ndpMirrorAddr(addr, iface, false)
 	}
@@ -298,15 +310,12 @@ func sweepIfaceFailedAndOrphans(iface *Interface) {
 	// entries on master interfaces are lifecycle-managed via mirroredNeighs
 	// and the own-address mirrors instead.)
 	if !iface.Master {
-		proxies, err := netlink.NeighList(link.Attrs().Index, unix.AF_INET6)
+		proxies, err := netlink.NeighProxyList(link.Attrs().Index, unix.AF_INET6)
 		if err != nil {
 			Debugf("sweep: list neighbors on %s: %v", iface.Ifname, err)
 			return
 		}
 		for _, n := range proxies {
-			if n.Flags&unix.NTF_PROXY == 0 {
-				continue
-			}
 			addr, ok := netip.AddrFromSlice(n.IP.To16())
 			if !ok {
 				continue
@@ -400,11 +409,8 @@ var reconcileScheduled bool
 // signal, so a single (debounced) reconcile off it restores proxy_ndp, the
 // proxy-NDP entries and the host routes together. Runs on the Engine goroutine.
 func handleRouteEvent(u netlink.RouteUpdate) {
-	if u.Type != unix.RTM_DELROUTE || u.Priority != ourRouteMetric || u.Dst == nil {
+	if u.Type != unix.RTM_DELROUTE || !isRelayHostRoute(u.Route) {
 		return
-	}
-	if ones, bits := u.Dst.Mask.Size(); bits != 128 || ones != 128 {
-		return // only our /128 host routes
 	}
 	if iface := ifaceByIndex(u.LinkIndex); iface == nil || iface.NDP != ModeRelay {
 		return
@@ -430,7 +436,7 @@ func scheduleReconcile() {
 
 // reconcileKernelState re-applies the proxy_ndp sysctl, proxy-NDP neighbor
 // entries and host routes the daemon is responsible for. Every underlying
-// operation (sysctl write, NeighSet, RouteReplace) is idempotent, so on the
+// operation (sysctl write, NeighSet, route add) is idempotent, so on the
 // steady-state happy path this is a cheap no-op; it only actually changes
 // anything when something external removed our state. Runs on the Engine
 // goroutine.
@@ -488,6 +494,7 @@ func handleLinkEvent(u netlink.LinkUpdate) {
 
 		disableServices(iface)
 		clearMirroredState(iface)
+		resetWANPrefixes(iface)
 		iface.Ifindex = 0
 		iface.Running = false
 		iface.Addr6 = nil
@@ -516,6 +523,7 @@ func handleLinkEvent(u netlink.LinkUpdate) {
 	// refer to the old index and must be replaced as one lifecycle change.
 	disableServices(iface)
 	clearMirroredState(iface)
+	resetWANPrefixes(iface)
 	iface.Ifindex = int(u.Index)
 	iface.Running = nowRunning
 	refreshInterfaceAddresses(iface)
@@ -693,38 +701,46 @@ func ndpMirrorAddr(addr netip.Addr, iface *Interface, add bool) {
 		}
 	}
 
-	if !iface.LearnRoutes || addr.IsLinkLocalUnicast() {
+	if (add && !iface.LearnRoutes) || addr.IsLinkLocalUnicast() {
 		return
 	}
 
-	if err := setupRoute(addr, 128, iface.Ifindex, nil, ourRouteMetric, add); err != nil {
+	route := relayHostRoute(addr, iface.Ifindex, ourRouteMetric)
+	var err error
+	if add {
+		err = netlink.RouteAdd(route)
+		if errors.Is(err, syscall.EEXIST) {
+			return // already installed or an existing route has priority
+		}
+	} else {
+		err = deleteRelayRoute(route)
+	}
+	if err != nil {
 		Warnf("route %s/128 via %s: %v", addr, iface.Ifname, err)
 	}
 }
 
-// setupRoute adds or removes a route via netlink.
-func setupRoute(addr netip.Addr, prefixlen int, ifindex int, gw *netip.Addr, metric int, add bool) error {
-	dst := &net.IPNet{IP: net.IP(addr.AsSlice()), Mask: net.CIDRMask(prefixlen, 128)}
-
-	route := &netlink.Route{
+func relayHostRoute(addr netip.Addr, ifindex, metric int) *netlink.Route {
+	return &netlink.Route{
 		LinkIndex: ifindex,
-		Dst:       dst,
+		Dst:       &net.IPNet{IP: net.IP(addr.AsSlice()), Mask: net.CIDRMask(128, 128)},
 		Priority:  metric,
 		Table:     unix.RT_TABLE_MAIN,
 		Scope:     netlink.SCOPE_LINK,
+		Protocol:  relayRouteProtocol,
 	}
+}
 
-	if gw != nil {
-		gwIP := net.IP(gw.AsSlice())
-		route.Gw = gwIP
-		route.Scope = netlink.SCOPE_UNIVERSE
+func isRelayHostRoute(route netlink.Route) bool {
+	if route.Protocol != relayRouteProtocol || route.Priority != ourRouteMetric ||
+		route.Table != unix.RT_TABLE_MAIN || route.Dst == nil {
+		return false
 	}
+	ones, bits := route.Dst.Mask.Size()
+	return ones == 128 && bits == 128
+}
 
-	if add {
-		route.Protocol = unix.RTPROT_STATIC
-		return netlink.RouteReplace(route)
-	}
-
+func deleteRelayRoute(route *netlink.Route) error {
 	// ESRCH ("no such process") from RouteDel just means the route is
 	// already gone (e.g. the kernel/network stack flushed it itself when
 	// the delegated prefix changed and the address was removed). The

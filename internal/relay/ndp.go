@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
@@ -353,12 +354,14 @@ func relayPing(target netip.Addr, iface *Interface) {
 		return
 	}
 
-	_ = setupRoute(target, 128, iface.Ifindex, nil, 128, true)
+	route := relayHostRoute(target, iface.Ifindex, 128)
+	if err := netlink.RouteAdd(route); err != nil {
+		return
+	}
+	defer deleteRelayRoute(route)
 
 	payload := make([]byte, 8)
 	payload[0] = icmp6EchoRequest
 
 	sendICMP6WithLLSrc(iface.ndp.pingFd, iface, target, iface.Ifindex, payload)
-
-	_ = setupRoute(target, 128, iface.Ifindex, nil, 128, false)
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"net/netip"
 	"testing"
+	"time"
 )
 
 func TestIsULAAndIsGlobalUnicast(t *testing.T) {
@@ -47,25 +48,16 @@ func buildTestRA(prefix netip.Prefix) []byte {
 	return pkt
 }
 
-func TestParsePIOPrefixesFiltersToULAAndGlobalUnicast(t *testing.T) {
-	cases := []struct {
-		prefix string
-		want   bool
-	}{
-		{"2001:db8:1::/64", true},
-		{"fd00:1::/64", false},
-		{"fe80::/64", false},
+func TestParsePIOPrefixes(t *testing.T) {
+	prefix := netip.MustParsePrefix("2001:db8:1::/64")
+	data := buildTestRA(prefix)
+	data = append(data, buildTestRA(netip.MustParsePrefix("fd00:1::/64"))[16:]...)
+	got := parsePIOPrefixes(data)
+	if len(got) != 1 || got[prefix] != 3600 {
+		t.Fatalf("parsePIOPrefixes() = %v, want one GUA PIO with lifetime 3600", got)
 	}
-
-	for _, c := range cases {
-		p := netip.MustParsePrefix(c.prefix)
-		got := parsePIOPrefixes(buildTestRA(p))
-		if c.want && (len(got) != 1 || got[0] != p.Masked()) {
-			t.Errorf("parsePIOPrefixes(%s) = %v, want [%s]", c.prefix, got, p.Masked())
-		}
-		if !c.want && len(got) != 0 {
-			t.Errorf("parsePIOPrefixes(%s) = %v, want empty", c.prefix, got)
-		}
+	if got := parsePIOPrefixes(append(data, 1, 0)); got != nil {
+		t.Fatalf("accepted invalid option framing: %v", got)
 	}
 }
 
@@ -93,150 +85,71 @@ func withCleanPrefixWatchState(t *testing.T) {
 	})
 }
 
-func TestTrackWANPrefixSnoopingSeedsSilentlyOnFirstRA(t *testing.T) {
+func TestOmittedPrefixRemainsLiveUntilAdvertisedLifetimeExpires(t *testing.T) {
 	withCleanPrefixWatchState(t)
-
-	wan := &Interface{Name: "wan", Ifname: "wan0", Master: true}
+	wan := &Interface{Master: true}
 	interfaces["wan"] = wan
-
-	want := netip.MustParsePrefix("2001:db8:1::/64")
-	trackWANPrefixSnooping(wan, buildTestRA(want))
-
-	if !wan.knownWANPrefixes[want] {
-		t.Fatalf("knownWANPrefixes = %v, want %v present", wan.knownWANPrefixes, want)
-	}
-	if len(activePrefixWatches) != 0 {
-		t.Fatalf("first (seeding) RA must not start any deprecation watch, got %v", activePrefixWatches)
-	}
-}
-
-func TestTrackWANPrefixSnoopingAddsNewPrefixImmediately(t *testing.T) {
-	withCleanPrefixWatchState(t)
-
-	wan := &Interface{Name: "wan", Ifname: "wan0", Master: true}
-	interfaces["wan"] = wan
-
-	oldPrefix := netip.MustParsePrefix("2001:db8:1::/64")
-	newPrefix := netip.MustParsePrefix("2001:db8:2::/64")
-
-	trackWANPrefixSnooping(wan, buildTestRA(oldPrefix)) // seed
-
-	// An RA can carry a brand new prefix without withdrawing the old one -
-	// it must be trusted right away (no threshold needed to *add* a
-	// prefix), and the old one must not be dropped after just one RA that
-	// happens not to repeat it.
-	trackWANPrefixSnooping(wan, buildTestRA(newPrefix))
-
-	if !wan.knownWANPrefixes[newPrefix] {
-		t.Fatalf("newly-seen prefix %s should be known immediately, got %v", newPrefix, wan.knownWANPrefixes)
-	}
-	if !wan.knownWANPrefixes[oldPrefix] {
-		t.Fatalf("old prefix %s should not be dropped after a single miss, got %v", oldPrefix, wan.knownWANPrefixes)
-	}
-}
-
-func TestTrackWANPrefixSnoopingDropsPrefixAfterThresholdConsecutiveMisses(t *testing.T) {
-	withCleanPrefixWatchState(t)
-
-	wan := &Interface{Name: "wan", Ifname: "wan0", Master: true}
-	interfaces["wan"] = wan
-
-	oldPrefix := netip.MustParsePrefix("2001:db8:1::/64")
-	newPrefix := netip.MustParsePrefix("2001:db8:2::/64")
-
-	trackWANPrefixSnooping(wan, buildTestRA(oldPrefix)) // seed
-
-	for i := 0; i < prefixMismatchThreshold-1; i++ {
-		trackWANPrefixSnooping(wan, buildTestRA(newPrefix))
-	}
-	if !wan.knownWANPrefixes[oldPrefix] {
-		t.Fatalf("old prefix %s dropped too early, got %v", oldPrefix, wan.knownWANPrefixes)
-	}
-
-	// The threshold-th consecutive RA missing oldPrefix (from both the RA
-	// itself and the interface's own address list) confirms it dead.
-	trackWANPrefixSnooping(wan, buildTestRA(newPrefix))
-	if wan.knownWANPrefixes[oldPrefix] {
-		t.Fatalf("old prefix %s should have been dropped after %d consecutive misses, got %v", oldPrefix, prefixMismatchThreshold, wan.knownWANPrefixes)
-	}
-}
-
-func TestTrackWANPrefixSnoopingResetsMissCountOnMatch(t *testing.T) {
-	withCleanPrefixWatchState(t)
-
-	wan := &Interface{Name: "wan", Ifname: "wan0", Master: true}
-	interfaces["wan"] = wan
-
-	oldPrefix := netip.MustParsePrefix("2001:db8:1::/64")
-	newPrefix := netip.MustParsePrefix("2001:db8:2::/64")
-
-	trackWANPrefixSnooping(wan, buildTestRA(oldPrefix)) // seed
-
-	trackWANPrefixSnooping(wan, buildTestRA(newPrefix))
-	trackWANPrefixSnooping(wan, buildTestRA(newPrefix))
-	// A real RA re-carrying oldPrefix in between resets its miss streak.
-	trackWANPrefixSnooping(wan, buildTestRA(oldPrefix))
-	trackWANPrefixSnooping(wan, buildTestRA(newPrefix))
-	trackWANPrefixSnooping(wan, buildTestRA(newPrefix))
-
-	if !wan.knownWANPrefixes[oldPrefix] {
-		t.Fatalf("old prefix %s should still be known (miss streak was reset), got %v", oldPrefix, wan.knownWANPrefixes)
-	}
-}
-
-func TestTrackWANPrefixSnoopingDropsPrefixEvenIfKernelAddressLingers(t *testing.T) {
-	withCleanPrefixWatchState(t)
-
-	oldPrefix := netip.MustParsePrefix("2001:db8:1::/64")
-	newPrefix := netip.MustParsePrefix("2001:db8:2::/64")
-
-	wan := &Interface{Name: "wan", Ifname: "wan0", Master: true, Addr6: []IPAddr{
-		// The interface's own kernel address list still shows an address
-		// under oldPrefix (typical of an upstream that never sent a
-		// proper RFC 4861 withdrawal - the address just lingers, counting
-		// down its old valid_lft) - this must NOT prevent detection, since
-		// that's exactly the scenario this feature exists to catch.
-		{Addr: mustParseAddr("2001:db8:1::1"), PrefixLen: 64},
-	}}
-	interfaces["wan"] = wan
-
-	trackWANPrefixSnooping(wan, buildTestRA(oldPrefix)) // seed
+	now := time.Now()
+	prefix := netip.MustParsePrefix("2001:db8:1::/64")
+	other := netip.MustParsePrefix("2001:db8:2::/64")
+	trackWANPrefixSnooping(wan, buildTestRA(prefix), now)
 
 	for i := 0; i < prefixMismatchThreshold; i++ {
-		trackWANPrefixSnooping(wan, buildTestRA(newPrefix))
+		trackWANPrefixSnooping(wan, buildTestRA(other), now.Add(time.Minute))
+		trackWANPrefixSnooping(wan, buildTestRA(other)[:16], now.Add(time.Minute))
 	}
-
-	if wan.knownWANPrefixes[oldPrefix] {
-		t.Fatalf("prefix %s should have been dropped after %d consecutive RAs missing it, regardless of the lingering kernel address, got %v",
-			oldPrefix, prefixMismatchThreshold, wan.knownWANPrefixes)
+	if !prefixIsLive(prefix, now.Add(time.Minute)) || activePrefixWatches[prefix] != nil {
+		t.Fatal("omitting a PIO shortened its advertised lifetime")
+	}
+	trackWANPrefixSnooping(wan, buildTestRA(other), now.Add(time.Hour))
+	if _, found := wan.knownWANPrefixes[prefix]; found {
+		t.Fatal("expired prefix was kept after the miss threshold")
 	}
 }
 
-// TestTrackWANPrefixSnoopingSeedsWithNewPrefixAfterRestart is a regression
-// test for the exact restart scenario the orphaned-LAN-neighbor backstop
-// (checkForOrphanedLANNeighbors) exists for: the WAN renumbers, the daemon
-// restarts, and the very first real RA it sees after that already carries
-// only the new prefix - so knownWANPrefixes gets silently seeded with just
-// the new one and never personally observes the old prefix dying.
-func TestTrackWANPrefixSnoopingSeedsWithNewPrefixAfterRestart(t *testing.T) {
+func TestExplicitZeroLifetimeWithdrawsKnownPrefix(t *testing.T) {
 	withCleanPrefixWatchState(t)
-
-	wan := &Interface{Name: "wan", Ifname: "wan0", Master: true}
+	wan := &Interface{Master: true}
 	interfaces["wan"] = wan
+	now := time.Now()
+	prefix := netip.MustParsePrefix("2001:db8:1::/64")
+	packet := buildTestRA(prefix)
+	binary.BigEndian.PutUint32(packet[20:24], 0xffffffff)
+	trackWANPrefixSnooping(wan, packet, now)
 
-	oldPrefix := netip.MustParsePrefix("2001:db8:1::/64")
-	newPrefix := netip.MustParsePrefix("2001:db8:2::/64")
-
-	// Simulates the daemon starting up fresh after the WAN already
-	// renumbered: the first real RA it ever sees only carries newPrefix.
-	// (checkForOrphanedLANNeighbors also runs here, but is a no-op since
-	// no LAN interfaces are registered in this test.)
-	trackWANPrefixSnooping(wan, buildTestRA(newPrefix))
-
-	if wan.knownWANPrefixes[oldPrefix] {
-		t.Fatalf("a fresh start must never know about a prefix it never observed, got %v", wan.knownWANPrefixes)
+	for i := 0; i < prefixMismatchThreshold; i++ {
+		trackWANPrefixSnooping(wan, packet[:16], now.Add(200*365*24*time.Hour))
 	}
-	if !wan.knownWANPrefixes[newPrefix] {
-		t.Fatalf("newPrefix should be seeded as known, got %v", wan.knownWANPrefixes)
+	if !prefixIsLive(prefix, now.Add(200*365*24*time.Hour)) {
+		t.Fatal("omission expired an infinite lifetime")
+	}
+
+	clear(packet[20:28])
+	trackWANPrefixSnooping(wan, packet, now.Add(time.Second))
+	if _, found := wan.knownWANPrefixes[prefix]; found {
+		t.Fatal("zero lifetime did not withdraw the prefix")
+	}
+}
+
+func TestRenewedPrefixCancelsQueuedWithdrawal(t *testing.T) {
+	withCleanPrefixWatchState(t)
+	wan := &Interface{Master: true}
+	interfaces["wan"] = wan
+	prefix := netip.MustParsePrefix("2001:db8:1::/64")
+	timer := time.NewTimer(time.Hour)
+	t.Cleanup(func() { timer.Stop() })
+	previous := &prefixDeprecationWatch{master: wan, timer: timer}
+	activePrefixWatches[prefix] = previous
+
+	trackWANPrefixSnooping(wan, buildTestRA(prefix), time.Now())
+	if activePrefixWatches[prefix] != nil || timer.Stop() {
+		t.Fatal("a live advertisement must cancel the pending withdrawal")
+	}
+
+	newWatch := &prefixDeprecationWatch{master: wan}
+	activePrefixWatches[prefix] = newWatch
+	firePrefixDeprecationWatch(prefix, previous)
+	if activePrefixWatches[prefix] != newWatch {
+		t.Fatal("the stale timer callback changed the replacement watch")
 	}
 }

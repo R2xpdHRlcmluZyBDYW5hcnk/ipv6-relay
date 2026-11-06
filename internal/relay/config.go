@@ -117,48 +117,6 @@ func findOrCreateInterface(name string) *Interface {
 	return i
 }
 
-// parseInterfaceJSON parses configuration for an interface.
-func parseInterfaceJSON(name string, obj jsonIface) error {
-	iface := findOrCreateInterface(name)
-
-	if iface.Ifname == "" && obj.Ifname == nil {
-		return fmt.Errorf("interface %q has no ifname configured", name)
-	}
-
-	if obj.Ifname != nil {
-		newIfname := *obj.Ifname
-		link, err := netlink.LinkByName(newIfname)
-		if err != nil {
-			return fmt.Errorf("interface %q (%s): %w", name, newIfname, err)
-		}
-
-		if iface.Ifindex != 0 &&
-			(iface.Ifname != newIfname || iface.Ifindex != link.Attrs().Index) {
-			disableServices(iface)
-			clearMirroredState(iface)
-		}
-
-		iface.Ifname = newIfname
-		iface.Ifindex = link.Attrs().Index
-		iface.Running = link.Attrs().RawFlags&unix.IFF_RUNNING != 0
-		refreshInterfaceAddresses(iface)
-	}
-
-	iface.Inuse = true
-
-	if obj.Master != nil {
-		iface.Master = *obj.Master
-	}
-	if obj.NdproxyRouting != nil {
-		iface.LearnRoutes = *obj.NdproxyRouting
-	}
-	if obj.NdpFromLinkLocal != nil {
-		iface.NdpFromLinkLocal = *obj.NdpFromLinkLocal
-	}
-
-	return nil
-}
-
 // loadConfigJSON reads and applies the JSON configuration file. It either
 // applies the file completely or leaves all relay state untouched: a config
 // that cannot be read or parsed (a truncated file mid-edit, hit by a
@@ -171,20 +129,55 @@ func loadConfigJSON(path string) error {
 	return applyConfigJSON(data)
 }
 
-// applyConfigJSON parses and applies configuration content. State is only
-// mutated once the JSON has parsed successfully.
+// applyConfigJSON resolves every configured device before changing live state.
 func applyConfigJSON(data []byte) error {
 	var root jsonRoot
 	if err := json.Unmarshal(data, &root); err != nil {
 		return fmt.Errorf("parse: %w", err)
 	}
 
-	// The file is good - reset every interface to its defaults and mark it
-	// not-in-use; parseInterfaceJSON below re-marks the ones present in the
-	// file and Reload closes the rest.
-	for _, i := range interfaces {
-		setInterfaceDefaults(i)
-		i.Inuse = false
+	links := make(map[string]*netlink.LinkAttrs, len(root.Interfaces))
+	usedIndices := make(map[int]string, len(root.Interfaces))
+	for name, obj := range root.Interfaces {
+		var ifname string
+		if obj.Ifname != nil {
+			ifname = *obj.Ifname
+		} else if old := interfaces[name]; old != nil {
+			ifname = old.Ifname
+		}
+		if ifname == "" {
+			return fmt.Errorf("interface %q has no ifname configured", name)
+		}
+		link, err := netlink.LinkByName(ifname)
+		if err != nil {
+			return fmt.Errorf("interface %q (%s): %w", name, ifname, err)
+		}
+		attrs := link.Attrs()
+		if previous, exists := usedIndices[attrs.Index]; exists {
+			return fmt.Errorf("interfaces %q and %q both use %s", previous, name, ifname)
+		}
+		usedIndices[attrs.Index] = name
+		links[name] = attrs
+	}
+
+	// Tear down changed links using their previous settings and peer set.
+	for name, i := range interfaces {
+		attrs := links[name]
+		if attrs == nil {
+			closeInterface(i)
+			continue
+		}
+		obj := root.Interfaces[name]
+		master := obj.Master != nil && *obj.Master
+		learnRoutes := obj.NdproxyRouting == nil || *obj.NdproxyRouting
+		linkChanged := i.Ifindex != attrs.Index || i.Ifname != attrs.Name || i.Master != master
+		if linkChanged || i.LearnRoutes != learnRoutes {
+			clearMirroredState(i)
+			disableServices(i)
+		}
+		if linkChanged {
+			resetWANPrefixes(i)
+		}
 	}
 
 	if root.Global != nil && root.Global.LogLevel != nil && !Cfg.LogLevelCmdline {
@@ -212,10 +205,19 @@ func applyConfigJSON(data []byte) error {
 		staleClientSweepInterval = time.Duration(*root.Global.StaleClientSweepIntervalSeconds) * time.Second
 	}
 
-	for name, ifaceObj := range root.Interfaces {
-		if err := parseInterfaceJSON(name, ifaceObj); err != nil {
-			Warnf("%v", err)
+	for name, obj := range root.Interfaces {
+		attrs := links[name]
+		iface := findOrCreateInterface(name)
+		setInterfaceDefaults(iface)
+		iface.Ifname = attrs.Name
+		iface.Ifindex = attrs.Index
+		iface.Running = attrs.RawFlags&unix.IFF_RUNNING != 0
+		iface.Master = obj.Master != nil && *obj.Master
+		iface.LearnRoutes = obj.NdproxyRouting == nil || *obj.NdproxyRouting
+		if obj.NdpFromLinkLocal != nil {
+			iface.NdpFromLinkLocal = *obj.NdpFromLinkLocal
 		}
+		refreshInterfaceAddresses(iface)
 	}
 
 	return nil
@@ -231,6 +233,7 @@ func closeInterface(i *Interface) {
 	// run while i is still registered, since ndpMirrorAddr iterates the
 	// map to find the masters.
 	clearMirroredState(i)
+	resetWANPrefixes(i)
 	delete(interfaces, i.Name)
 
 	routerSetup(i, false)
@@ -310,22 +313,8 @@ func Reload() {
 		}
 	}
 
-	// Only drop interfaces that are no longer present in the reloaded
-	// config at all; one that is merely not IFF_RUNNING yet must stay
-	// registered so a later link-up netlink event can find and enable it.
-	for _, i := range copyIfaceList() {
-		if i.Inuse {
-			reloadServices(i)
-		} else {
-			closeInterface(i)
-		}
-	}
-}
-
-func copyIfaceList() []*Interface {
-	out := make([]*Interface, 0, len(interfaces))
+	// A configured device with no carrier stays registered for link-up events.
 	for _, i := range interfaces {
-		out = append(out, i)
+		reloadServices(i)
 	}
-	return out
 }

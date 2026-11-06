@@ -40,7 +40,6 @@ type Interface struct {
 
 	LearnRoutes      bool
 	NdpFromLinkLocal bool
-	Inuse            bool
 
 	Addr6 []IPAddr
 
@@ -60,21 +59,8 @@ type Interface struct {
 	rsTimer  *time.Timer
 	rsTimerN int // generation counter to invalidate stale timers after reload
 
-	// knownWANPrefixes/missCounts/wanPrefixSeeded back trackWANPrefixSnooping
-	// (see prefixwatch.go): real-time snooping of the actual Router
-	// Advertisements received on this master interface determines which
-	// ULA/GUA prefixes are currently "live" - an RA can legitimately carry
-	// several such prefixes at once. Deliberately NOT cross-checked
-	// against the interface's own kernel address list (see prefixwatch.go's
-	// package doc comment for why). A previously-known prefix is only
-	// dropped as dead after prefixMismatchThreshold consecutive real RAs
-	// in which it's absent from that RA's PIOs. knownWANPrefixes is also
-	// read by checkForOrphanedLANNeighbors as the reference set for
-	// spotting a LAN neighbor stuck on a prefix this process never
-	// personally watched die (e.g. after a restart).
-	knownWANPrefixes map[netip.Prefix]bool
-	missCounts       map[netip.Prefix]int
-	wanPrefixSeeded  bool
+	// knownWANPrefixes tracks the latest advertised lifetime and omissions.
+	knownWANPrefixes map[netip.Prefix]wanPrefixState
 
 	// lastRA* caches the fixed header of the last real Router Advertisement
 	// relayed on this master interface, so a synthesized prefix-deprecation

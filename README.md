@@ -14,7 +14,7 @@
 
 ## 编译
 
-只需要 Go 工具链（1.22+），没有其他系统依赖：
+构建只需要 Go 工具链。项目和发布流程使用 Go 1.27.3，模块最低要求 Go 1.25.0：
 
 ```bash
 git clone https://gitee.com/Y2FuYXJ5/ipv6-relay.git
@@ -72,32 +72,18 @@ sudo chmod 644 /etc/ipv6-relay/config.json
 |------|----------|------|
 | `log_level` | 可选，默认 4 | 日志级别 0-7（同 `-l` 命令行参数，配置文件优先级低于显式传入的 `-l`） |
 | `send_prefix_deprecation` | 可选，默认 `true` | 是否在检测到 WAN 口某个前缀确实已经消失时，向 LAN 侧仍在使用该前缀地址的邻居发送 lifetime=0 的终结通告（见下方说明）——如果不想要这个自动发送终结通告的行为，直接关掉这个开关即可 |
-| `prefix_mismatch_packet_threshold` | 可选，默认 3 | 实时 snoop WAN 口收到的真实 RA 报文时，一个已记录的前缀连续多少次没有出现在 RA 里，才判定它确实消失（防止上游把多个仍然有效的前缀分散在不同 RA 里发送时被误判） |
-| `send_prefix_deprecation_interval_seconds` | 可选，默认 300 | 确认前缀消失后，终结通告的重发间隔（秒），直到 LAN 侧不再有使用该前缀地址的邻居为止才停止 |
+| `prefix_mismatch_packet_threshold` | 可选，默认 3 | 已过有效期的前缀还需满足的连续缺席次数 |
+| `send_prefix_deprecation_interval_seconds` | 可选，默认 300 | 确认前缀消失后，终结通告的重发间隔（秒），直到 LAN 侧不再有使用该前缀地址的邻居或前缀恢复有效 |
 | `stale_client_sweep_interval_seconds` | 可选，默认 300 | 周期性兜底扫描的间隔（秒）：清理已经 `NUD_FAILED` 或邻居表项已消失的镜像（proxy-NDP + `/128` 主机路由），并主动探测处于 `NUD_STALE` 的邻居 |
 
-本项目会对每个 `master` 接口实时 snoop 收到的真实 RA 报文，解析其中的 PIO（Prefix Information
-Option），只关心公网可路由（GUA）的前缀（不含 link-local、组播、ULA），并且是**一个集合**
-而不是单一前缀——RA 本来就可以同时携带多个前缀，只要某个前缀出现在这次收到的 RA 里，就算它仍然
-有效，不会当成过时。判断前缀是否消失**只看实时收到的 RA 报文本身**，故意不去看 WAN 口内核当前的
-地址列表——这个功能本来就是为了应对上游路由器前缀过期后不发送正确的 `valid_lft=0`/
-`preferred_lft=0` 撤回通告的情况，这种情况下 WAN 口自己的内核地址本来就会因为拿着旧的
-`valid_lft` 继续倒计时、迟迟不消失，如果拿它来做保护，等于直接把这个功能废掉了。只有一个已记录
-的前缀连续 `prefix_mismatch_packet_threshold` 次都没有出现在收到的 RA 里，才判定它确实消失了
-（例如上游重新编号/更换了前缀）——这样即使上游把多个仍然有效的前缀分散在不同 RA 里发送，也不会
-被误判成前缀消失。接口刚启动收到的第一个真实 RA 只会静默记录当前的前缀集合，不会触发通告，避免
-把重启前就已存在的合法前缀误判为"过时"。一旦确认某个前缀消失了，就会向所有下游
-（非 `master`）接口里仍有该前缀下地址的邻居，发送一份只带有该前缀 PIO（Valid/Preferred
-Lifetime 均为 0）的合成 RA，之后每隔 `send_prefix_deprecation_interval_seconds` 重发一次，直到 LAN
-侧的邻居表里再也找不到该前缀下的地址为止。
+每个 `master` 接口会从上游 RA 的 PIO（Prefix Information Option）记录公网 IPv6 前缀及其有效期。
+同一份 RA 可以携带多个 PIO，也可以省略仍有效的 PIO。程序仅在前缀有效期届满、且连续缺席达到
+`prefix_mismatch_packet_threshold` 时判定前缀失效。上游明确通告零有效期时立即记录撤销。
+若其他上游仍通告该前缀有效，程序会保留其有效状态。
 
-这套前缀集合本身只在内存里，进程重启后会清空重新静默记录，所以还有一种情况需要额外处理：如果
-WAN 口在重启前就已经悄悄换了前缀，重启后进程只会记住新前缀，永远不会"亲眼"观察到旧前缀消失的
-过程——这时如果 LAN 侧某台设备还没放弃使用旧前缀的地址，就会一直用坏地址尝试连接，没人再通知它。
-所以每处理完一个真实 RA，除了比对 WAN 口自己的前缀集合，也会顺便枚举一遍所有下游接口邻居表里的
-ULA/公网地址，跟同一份前缀集合做比对——只要某个邻居地址不属于集合里任何一个前缀，就立刻（不需要
-再等待 `prefix_mismatch_packet_threshold` 次确认，因为这份集合本身已经是确认过的）向它发送终结
-通告并按同样的重发/停止规则处理。
+确认失效后，程序会向仍有该前缀邻居的 LAN 接口发送 Valid Lifetime 和 Preferred Lifetime
+均为零的 PIO，并按 `send_prefix_deprecation_interval_seconds` 重发，直到邻居消失或前缀重新有效。
+该记录保存在内存中。重启后，程序从新的上游 RA 建立记录，缺少历史记录的前缀继续由客户端按原通告的有效期管理。
 
 本项目只做 relay，不支持其他模式，所以**只要接口出现在配置里，就会同时中继 DHCPv6 / RA / NDP 三种服务**，不需要（也无法）单独开关；不想中继某个接口，直接把它从配置里删掉即可。`master` 用来标记哪一侧是上游：至少要有一个接口设为 `"master": true`，其余不带 `master` 的接口视为下游（LAN 侧）。
 
@@ -120,7 +106,7 @@ sudo ipv6-relay -c /etc/ipv6-relay/config.json
 | `-f` | 日志输出到 stderr，而不是 syslog |
 | `-h` | 显示帮助 |
 
-发送 `SIGHUP` 可以在不重启进程的情况下重新加载配置文件（`systemctl reload ipv6-relay`）。
+发送 `SIGHUP` 可以在不重启进程的情况下重新加载配置文件（`systemctl reload ipv6-relay`）。JSON 无法解析、网卡名无效或同一网卡重复配置时，服务会保留当前配置并在日志中记录错误。
 
 ### 3. 用 systemd 管理（推荐）
 
@@ -136,6 +122,7 @@ sudo journalctl -u ipv6-relay -f
 
 - **必须启用内核 IPv6 转发**（`net.ipv6.ip_forward=1` / `net.ipv6.conf.all.forwarding=1`）。中继的数据面就是内核自己的转发：NDP/RA/DHCPv6 中继在没有 forwarding 时看起来一切正常，但实际流量会被丢弃，看起来像中继的 bug。程序启动时会检测该开关并告警。
 - 转发的 RA 原样保留上游的 on-link（L）标志，下游主机会认为整个前缀在链路上、直接对 WAN 侧目标发 Neighbor Solicitation。本程序会在下游接口上为已知位于其他中继接口背后的目标安装 proxy-NDP 表项，让内核代答这些 NS（DAD 探测除外，避免干扰地址配置）；目标首次被解析期间的重传可能需要 1–2 秒才得到应答。
+- 中继创建的 IPv6 主机路由标记为协议号 196。周期清理仅删除带此标记的中继路由。升级前已有的 `proto static` 路由会保留。下游中继接口上的 proxy-NDP 表由中继管理。
 - 进程退出（SIGTERM/SIGINT）时**有意不清除**已安装的 proxy-NDP 表项、/128 主机路由和 `proxy_ndp` sysctl：这样 daemon 重启/升级的窗口期内下游连通性不受影响，再次启动时会自动重建并回收这些状态。如需彻底清理，重新开关接口或重启网络即可。
 - 进程本身不再强制要求以 UID 0 运行；`systemd` 单元通过 `DynamicUser=yes` 在启动时为它分配一个专属的临时系统 UID/GID（服务停止后回收），再通过 `AmbientCapabilities`（`CAP_NET_RAW` + `CAP_NET_ADMIN` + `CAP_NET_BIND_SERVICE`）获得操作原始套接字、netlink 路由表和绑定 DHCPv6 547 端口所需的权限，不需要完整 root。
 - 如果不通过 systemd、而是手动在命令行执行 `ipv6-relay`，仍然需要 root（或者自行用 `setcap` 给二进制加上同样三个 capability 后再以非 root 用户运行）。
@@ -143,6 +130,15 @@ sudo journalctl -u ipv6-relay -f
 - 相比让服务以 `nobody` 这种所有服务共用的账户运行（systemd 会警告 `Special user nobody configured, this is not safe!`，因为多个服务共用同一 UID 存在互相干扰的风险），`DynamicUser` 为每个服务分配独占的临时 UID，隔离性更好，也不需要像 `useradd -r -s /sbin/nologin ipv6-relay` 那样手动创建专用系统账户。
 - 确保内核已启用 IPv6。
 - 检查防火墙是否放行 ICMPv6 / DHCPv6 流量。
+
+## 回归测试
+
+在允许创建用户和网络命名空间的 Linux 环境中运行。测试会在隔离网络里创建临时接口、路由和代理邻居。
+
+```bash
+unshare -Urn env IPV6_RELAY_NETNS_TEST=1 go test -race ./...
+go vet ./...
+```
 
 ## 项目结构
 
