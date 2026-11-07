@@ -1,10 +1,10 @@
 # ipv6-relay
 
-Linux IPv6 中继守护进程，支持 DHCPv6、路由通告（RA）和邻居发现（NDP）。项目使用 Go，提供 JSON 配置示例和 systemd 服务。
+A Linux IPv6 relay daemon supporting DHCPv6, Router Advertisements (RA), and Neighbor Discovery (NDP). Written in Go, it includes a sample JSON configuration and a systemd service unit.
 
-## 编译
+## Build
 
-项目和发布流程使用 Go 1.27.3，模块最低要求 Go 1.25.0。
+The project and release workflow use Go 1.27.3. The module requires Go 1.25.0 or later.
 
 ```bash
 git clone https://gitee.com/Y2FuYXJ5/ipv6-relay.git
@@ -13,23 +13,23 @@ go build -o ipv6-relay ./cmd/ipv6-relay
 sudo install -m 755 ipv6-relay /usr/sbin/ipv6-relay
 ```
 
-## 交叉编译
+## Cross-compilation
 
-为 ARM64 Linux 路由器构建静态二进制文件。
+Build a static binary for an ARM64 Linux router:
 
 ```bash
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o ipv6-relay-arm64 ./cmd/ipv6-relay
 ```
 
-复制到目标路由器。将 `router.example` 替换为路由器的主机名或 IP 地址。
+Copy it to the target router. Replace `router.example` with the router's hostname or IP address.
 
 ```bash
 scp ipv6-relay-arm64 root@router.example:/usr/sbin/ipv6-relay
 ```
 
-## 使用
+## Usage
 
-### 1. 准备配置文件
+### 1. Prepare the configuration file
 
 ```bash
 sudo mkdir -p /etc/ipv6-relay
@@ -37,64 +37,64 @@ sudo cp config.json.example /etc/ipv6-relay/config.json
 sudo editor /etc/ipv6-relay/config.json
 ```
 
-systemd 服务以临时用户运行，该用户需要能读取配置文件。
+The systemd service runs as a temporary user that needs read access to the configuration file.
 
 ```bash
 sudo chmod 755 /etc/ipv6-relay
 sudo chmod 644 /etc/ipv6-relay/config.json
 ```
 
-[`config.json.example`](config.json.example) 包含所有配置字段。`interfaces` 下的键是接口标识，实际网卡名由 `ifname` 指定。配置至少一个 `"master": true` 的上游接口和一个下游接口。每个已配置的接口同时中继 DHCPv6、RA 和 NDP。
+[`config.json.example`](config.json.example) includes all configuration fields. Keys under `interfaces` are interface identifiers; `ifname` specifies the actual network interface name. Configure at least one upstream interface with `"master": true` and one downstream interface. Each configured interface relays DHCPv6, RA, and NDP.
 
-| 字段 | 是否必选 | 说明 |
+| Field | Required / default | Description |
 |------|----------|------|
-| `ifname` | 必选 | 系统上真实的网卡名（如 `eth0`） |
-| `master` | 可选，默认 `false` | 标记这是上游（WAN）接口 |
-| `ndproxy_routing` | 可选，默认 `true` | 为此接口的镜像邻居安装 `/128` 主机路由。设为 `false` 时仅安装代理邻居条目 |
-| `ndp_from_link_local` | 可选，默认 `true` | 发送 NDP 主动探测报文时优先使用本接口的链路本地地址 |
+| `ifname` | Required | Actual network interface name on the system, such as `eth0` |
+| `master` | Optional; default: `false` | Marks the interface as upstream (WAN) |
+| `ndproxy_routing` | Optional; default: `true` | Installs `/128` host routes for neighbors mirrored on this interface. When `false`, only proxy neighbor entries are installed |
+| `ndp_from_link_local` | Optional; default: `true` | Prefers this interface's link-local address when sending active NDP probes |
 
-全局配置（`global`）
+Global configuration (`global`):
 
-| 字段 | 是否必选 | 说明 |
+| Field | Required / default | Description |
 |------|----------|------|
-| `log_level` | 可选，默认 4 | 日志级别 0-7（同 `-l` 命令行参数，配置文件优先级低于显式传入的 `-l`） |
-| `send_prefix_deprecation` | 可选，默认 `true` | 确认前缀失效后，向仍有该前缀邻居的下游接口发送合成撤销通告 |
-| `prefix_mismatch_packet_threshold` | 可选，默认 3 | 已过有效期的前缀还需满足的连续缺席次数 |
-| `send_prefix_deprecation_interval_seconds` | 可选，默认 300 | 合成前缀撤销通告的重发间隔，单位为秒 |
-| `stale_client_sweep_interval_seconds` | 可选，默认 300 | 邻居扫描间隔，单位为秒。清理已消失或处于 `NUD_FAILED` 的邻居镜像，探测处于 `NUD_STALE` 的邻居 |
+| `log_level` | Optional; default: 4 | Log level from 0 to 7, as with the `-l` command-line option. An explicitly supplied `-l` takes precedence over the configuration file |
+| `send_prefix_deprecation` | Optional; default: `true` | Sends synthetic withdrawal advertisements to downstream interfaces that still have neighbors using a prefix once it is confirmed invalid |
+| `prefix_mismatch_packet_threshold` | Optional; default: 3 | Number of consecutive absences required in addition to prefix lifetime expiry |
+| `send_prefix_deprecation_interval_seconds` | Optional; default: 300 | Interval in seconds between repeated synthetic prefix withdrawal advertisements |
+| `stale_client_sweep_interval_seconds` | Optional; default: 300 | Neighbor sweep interval in seconds. Removes mirrored entries for neighbors that have disappeared or entered `NUD_FAILED`, and probes neighbors in `NUD_STALE` |
 
-每个 `master` 接口会从上游 RA 的 PIO（Prefix Information Option）记录公网 IPv6 前缀及其有效期。
-同一份 RA 可以携带多个 PIO，也可以省略仍有效的 PIO。程序仅在前缀有效期届满、且连续缺席达到
-`prefix_mismatch_packet_threshold` 时判定前缀失效。上游明确通告零有效期时立即记录撤销。
-合成撤销通告前，程序会检查其他上游对该前缀的有效期。
+Each `master` interface tracks public IPv6 prefixes and their valid lifetimes from PIOs (Prefix Information Options) in upstream RAs.
+A single RA may contain multiple PIOs and may omit a PIO whose prefix is still valid. A prefix is considered invalid only after its valid lifetime expires and its consecutive absences reach
+`prefix_mismatch_packet_threshold`. An explicit upstream advertisement with a zero valid lifetime records a withdrawal immediately.
+Before generating a withdrawal advertisement, the daemon checks the prefix's valid lifetime on other upstream interfaces.
 
-确认失效后，程序会向仍有该前缀邻居的 LAN 接口发送 Valid Lifetime 和 Preferred Lifetime
-均为零的 PIO，并按 `send_prefix_deprecation_interval_seconds` 重发，直到邻居消失或前缀重新有效。
-该记录保存在内存中。重启后，程序从新的上游 RA 建立记录，缺少历史记录的前缀继续由客户端按原通告的有效期管理。
+Once a prefix is confirmed invalid, the daemon sends PIOs with both Valid Lifetime and Preferred Lifetime
+set to zero to LAN interfaces that still have neighbors using that prefix. It repeats these advertisements every `send_prefix_deprecation_interval_seconds` until the neighbors disappear or the prefix becomes valid again.
+These records are kept in memory. After a restart, the daemon rebuilds them from new upstream RAs. Clients continue to manage prefixes without historical records according to the lifetimes originally advertised.
 
-### 2. 运行
+### 2. Run the daemon
 
 ```bash
-# 将调试日志输出到标准错误
+# Write debug logs to standard error
 sudo ipv6-relay -c /etc/ipv6-relay/config.json -f -l 7
 
-# 使用配置文件运行
+# Run with the configuration file
 sudo ipv6-relay -c /etc/ipv6-relay/config.json
 ```
 
-命令行选项
+Command-line options:
 
-| 选项 | 说明 |
+| Option | Description |
 |------|------|
-| `-c <file>` | 必选，JSON 配置文件路径 |
-| `-l <level>` | 日志级别 0-7，默认 4 |
-| `-f` | 将日志输出到标准错误 |
-| `-v` | 显示版本 |
-| `-h` | 显示帮助 |
+| `-c <file>` | Required; path to the JSON configuration file |
+| `-l <level>` | Log level from 0 to 7; default: 4 |
+| `-f` | Write logs to standard error |
+| `-v` | Show the version |
+| `-h` | Show help |
 
-发送 `SIGHUP` 可以在不重启进程的情况下重新加载配置文件（`systemctl reload ipv6-relay`）。JSON 无法解析、网卡名无效或同一网卡重复配置时，服务会保留当前配置并在日志中记录错误。
+Send `SIGHUP` to reload the configuration without restarting the process (`systemctl reload ipv6-relay`). If the JSON cannot be parsed, an interface name is invalid, or the same interface is configured more than once, the service keeps its current configuration and logs an error.
 
-### 3. 用 systemd 管理（推荐）
+### 3. Manage with systemd (recommended)
 
 ```bash
 sudo cp ipv6-relay.service /usr/lib/systemd/system/ipv6-relay.service
@@ -104,34 +104,34 @@ sudo systemctl status ipv6-relay.service
 sudo journalctl -u ipv6-relay -f
 ```
 
-### 注意事项
+### Notes
 
-- 启用内核 IPv6 转发（`net.ipv6.conf.all.forwarding=1`），并在防火墙放行 ICMPv6 和 DHCPv6。程序启动时会检查 IPv6 转发设置。
-- 中继保留 RA 的 on-link（L）标志。下游主机发送邻居请求时，中继会为已知位于其他接口的目标安装代理条目，由内核应答后续请求。DAD 探测不会触发代理条目安装。
-- 中继创建的 IPv6 主机路由标记为协议号 196。周期清理仅删除带此标记的中继路由。升级前已有的 `proto static` 路由会保留。下游中继接口上的 proxy-NDP 表由中继管理。
-- 服务退出时保留已安装的代理邻居条目、主机路由和 `proxy_ndp` 设置，以便重启期间继续转发。重新启动后，服务会同步中继状态。停用服务时，按需清理这些内核状态。
-- systemd 通过 `DynamicUser=yes` 为服务分配临时 UID/GID，并授予 `CAP_NET_RAW`、`CAP_NET_ADMIN` 和 `CAP_NET_BIND_SERVICE`，用于原始套接字、网络配置和 DHCPv6 端口 547。手动运行时，以 root 执行或使用 `setcap` 授予相同权限。
+- Enable kernel IPv6 forwarding (`net.ipv6.conf.all.forwarding=1`) and allow ICMPv6 and DHCPv6 through the firewall. The daemon checks the IPv6 forwarding setting at startup.
+- The relay preserves the RA on-link (L) flag. When a downstream host sends a Neighbor Solicitation for a target known to be on another interface, the relay installs a proxy entry so the kernel can answer subsequent solicitations. DAD probes do not trigger proxy entry installation.
+- IPv6 host routes created by the relay are tagged with protocol number 196. Periodic cleanup removes only relay routes with this tag. Existing `proto static` routes from before an upgrade are preserved. The relay manages the proxy-NDP table on downstream relay interfaces.
+- On exit, the service preserves installed proxy neighbor entries, host routes, and `proxy_ndp` settings so forwarding can continue during a restart. The service synchronizes relay state when it starts again. When decommissioning the service, clean up these kernel settings and entries as needed.
+- With `DynamicUser=yes`, systemd assigns the service a temporary UID/GID and grants `CAP_NET_RAW`, `CAP_NET_ADMIN`, and `CAP_NET_BIND_SERVICE` for raw sockets, network configuration, and DHCPv6 port 547. When running manually, use root or grant the same capabilities with `setcap`.
 
-## 回归测试
+## Regression tests
 
-在允许创建用户和网络命名空间的 Linux 环境中运行。测试会在隔离网络里创建临时接口、路由和代理邻居。
+Run in a Linux environment that allows user and network namespaces. The tests create temporary interfaces, routes, and proxy neighbors in an isolated network.
 
 ```bash
 unshare -Urn env IPV6_RELAY_NETNS_TEST=1 go test -race ./...
 go vet ./...
 ```
 
-## 项目结构
+## Project structure
 
 ```
-├── cmd/ipv6-relay/      # 主程序入口 (main.go, CLI 参数解析)
-├── internal/relay/      # 核心实现：config/engine/log + router(RA)/dhcpv6/ndp 三个中继子系统
-├── config.json.example  # 配置示例
-├── ipv6-relay.service   # systemd 服务文件
+├── cmd/ipv6-relay/     # Main entry point (main.go, CLI argument parsing)
+├── internal/relay/     # Core: config/engine/log and router (RA)/dhcpv6/ndp relay subsystems
+├── config.json.example # Sample configuration
+├── ipv6-relay.service  # systemd service unit
 ├── go.mod / go.sum
 └── LICENSE
 ```
 
-## 许可证
+## License
 
 [MIT](LICENSE)
